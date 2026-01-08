@@ -1,5 +1,7 @@
 FROM node:24-alpine AS builder
 
+ENV NODE_OPTIONS="--max-old-space-size=6096"
+
 RUN apk update && \
     apk add --no-cache git ffmpeg wget curl bash openssl
 
@@ -31,6 +33,8 @@ RUN ./Docker/scripts/generate_database.sh
 RUN npm run build
 
 FROM node:24-alpine AS final
+
+ENV NODE_OPTIONS="--max-old-space-size=6096"
 
 RUN apk update && \
     apk add tzdata ffmpeg bash openssl
