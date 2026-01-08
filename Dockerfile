@@ -1,6 +1,8 @@
 FROM node:20-alpine AS builder
 
-ENV NODE_OPTIONS="--max-old-space-size=6096"
+ENV NODE_ENV=production
+ENV npm_config_ignore_scripts=true
+ENV NODE_OPTIONS="--max-old-space-size=4028"
 
 RUN apk update && \
     apk add --no-cache git ffmpeg wget curl bash openssl
@@ -15,7 +17,7 @@ COPY ./package*.json ./
 COPY ./tsconfig.json ./
 COPY ./tsup.config.ts ./
 
-RUN npm i --ignore-scripts
+RUN npm ci
 
 COPY ./src ./src
 COPY ./public ./public
