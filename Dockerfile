@@ -1,7 +1,5 @@
 FROM node:20-alpine AS builder
 
-ENV NODE_OPTIONS="--max-old-space-size=6096"
-
 RUN apk update && \
     apk add --no-cache git ffmpeg wget curl bash openssl
 
