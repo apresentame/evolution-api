@@ -15,7 +15,7 @@ COPY ./package*.json ./
 COPY ./tsconfig.json ./
 COPY ./tsup.config.ts ./
 
-RUN npm i
+RUN npm i --legacy-peer-deps
 
 COPY ./src ./src
 COPY ./public ./public
