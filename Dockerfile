@@ -1,5 +1,7 @@
 FROM node:24-alpine AS builder
 
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+
 RUN apk update && \
     apk add --no-cache git ffmpeg wget curl bash openssl dos2unix
 
@@ -13,7 +15,7 @@ COPY ./package*.json ./
 COPY ./tsconfig.json ./
 COPY ./tsup.config.ts ./
 
-RUN NODE_OPTIONS="--max-old-space-size=6096" npm ci
+RUN npm ci --legacy-peer-deps
 
 COPY ./src ./src
 COPY ./public ./public
@@ -28,11 +30,9 @@ RUN chmod +x ./Docker/scripts/* && dos2unix ./Docker/scripts/*
 
 RUN ./Docker/scripts/generate_database.sh
 
-RUN NODE_OPTIONS="--max-old-space-size=6096" npm run build
+RUN npm run build
 
 FROM node:24-alpine AS final
-
-ENV NODE_OPTIONS="--max-old-space-size=6096"
 
 RUN apk update && \
     apk add tzdata ffmpeg bash openssl
