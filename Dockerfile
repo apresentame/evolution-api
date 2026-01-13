@@ -13,8 +13,6 @@ COPY ./package*.json ./
 COPY ./tsconfig.json ./
 COPY ./tsup.config.ts ./
 
-RUN NODE_OPTIONS="--max-old-space-size=6096" npm ci
-
 COPY ./src ./src
 COPY ./public ./public
 COPY ./prisma ./prisma
