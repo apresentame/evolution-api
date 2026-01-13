@@ -71,7 +71,7 @@ model Instance {
   integration             String?                  @db.VarChar(100)
   number                  String?                  @db.VarChar(100)
   businessId              String?                  @db.VarChar(100)
-  token                   String?                  @db.VarChar(255)
+  token                   String?                  @db.VarChar(500)
   clientName              String?                  @db.VarChar(100)
   disconnectionReasonCode Int?                     @db.Integer
   disconnectionObject     Json?                    @db.JsonB
@@ -89,6 +89,7 @@ model Instance {
   Rabbitmq                Rabbitmq?
   Nats                    Nats?
   Sqs                     Sqs?
+  Kafka                   Kafka?
   Websocket               Websocket?
   Typebot                 Typebot[]
   Session                 Session?
@@ -304,6 +305,16 @@ model Nats {
 }
 
 model Sqs {
+  id         String    @id @default(cuid())
+  enabled    Boolean   @default(false) @db.Boolean
+  events     Json      @db.JsonB
+  createdAt  DateTime? @default(now()) @db.Timestamp
+  updatedAt  DateTime  @updatedAt @db.Timestamp
+  Instance   Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  instanceId String    @unique
+}
+
+model Kafka {
   id         String    @id @default(cuid())
   enabled    Boolean   @default(false) @db.Boolean
   events     Json      @db.JsonB
