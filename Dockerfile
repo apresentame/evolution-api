@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git ffmpeg wget curl bash openssl ca-certificates dos2unix \
  && rm -rf /var/lib/apt/lists/*
 
-LABEL version="2.3.1" description="Api to control whatsapp features through http requests." 
+LABEL version="2.3.1" description="Api to control whatsapp features through http requests."
 LABEL maintainer="Davidson Gomes" git="https://github.com/DavidsonGomes"
 LABEL contact="contato@evolution-api.com"
 
@@ -22,7 +22,6 @@ COPY ./prisma ./prisma
 COPY ./manager ./manager
 COPY ./.env.example ./.env
 COPY ./runWithProvider.js ./
-
 COPY ./Docker ./Docker
 
 RUN chmod +x ./Docker/scripts/* && dos2unix ./Docker/scripts/*
@@ -33,6 +32,9 @@ ENV NODE_OPTIONS="--max-old-space-size=4096"
 ENV ESBUILD_MAX_THREADS=2
 
 RUN npm run build
+
+
+FROM node:24-bookworm-slim AS final
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata ffmpeg bash openssl ca-certificates \
@@ -55,8 +57,6 @@ COPY --from=builder /evolution/.env ./.env
 COPY --from=builder /evolution/Docker ./Docker
 COPY --from=builder /evolution/runWithProvider.js ./runWithProvider.js
 COPY --from=builder /evolution/tsup.config.ts ./tsup.config.ts
-
-ENV DOCKER_ENV=true
 
 EXPOSE 8080
 
