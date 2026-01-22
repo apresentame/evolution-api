@@ -266,6 +266,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    // Mark instance as deleting to prevent reconnection attempts
     this.isDeleting = true;
     this.endSession = true;
 
@@ -290,6 +291,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       }
 
+      // Improved socket cleanup
       try {
         if (this.client.ws) {
           this.client.ws.close();
