@@ -273,18 +273,32 @@ export class BaileysStartupService extends ChannelStartupService {
     this.messageProcessor.onDestroy();
 
     if (this.client) {
-      try {
-        await this.client.logout('Log out instance: ' + this.instanceName);
-      } catch (error) {
-        this.logger.error({ message: 'Error during logout', error });
+      const isConnectionOpen = this.stateConnection.state === 'open';
+
+      if (isConnectionOpen) {
+        try {
+          await this.client.logout('Log out instance: ' + this.instanceName);
+        } catch (error) {
+          const errorObj = error as any;
+          const statusCode = errorObj?.output?.statusCode;
+          const errorMessage = String(errorObj?.message || errorObj?.error?.message || '').toLowerCase();
+          const isConnectionClosedError =
+            statusCode === 428 || errorMessage.includes('connection closed') || errorMessage.includes('socket closed');
+
+          if (!isConnectionClosedError) {
+            this.logger.error({ message: 'Error during logout', error });
+          }
+        }
       }
 
       // Improved socket cleanup
       try {
-        this.client.ws?.close();
+        if (this.client.ws) {
+          this.client.ws.close();
+        }
         this.client.end(new Error('Instance logout'));
-      } catch (error) {
-        this.logger.error({ message: 'Error during socket cleanup', error });
+      } catch {
+        // Ignore cleanup errors when connection is already closed
       }
     }
 
@@ -314,6 +328,43 @@ export class BaileysStartupService extends ChannelStartupService {
     if (sessionExists) {
       await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
     }
+
+    this.stateConnection = {
+      state: 'close',
+      statusReason: DisconnectReason.loggedOut,
+    };
+
+    const disconnectionData = {
+      connectionStatus: 'close' as const,
+      disconnectionAt: new Date(),
+      disconnectionReasonCode: DisconnectReason.loggedOut,
+    };
+
+    await this.prismaRepository.instance.update({
+      where: { id: this.instanceId },
+      data: disconnectionData,
+    });
+
+    this.sendDataWebhook(Events.STATUS_INSTANCE, {
+      instance: this.instance.name,
+      status: 'closed',
+      ...disconnectionData,
+    });
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+      instance: this.instance.name,
+      ...this.stateConnection,
+    });
+
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+      this.chatwootService.eventWhatsapp(
+        Events.STATUS_INSTANCE,
+        { instanceName: this.instance.name, instanceId: this.instanceId },
+        { instance: this.instance.name, status: 'closed' },
+      );
+    }
+
+    this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
   }
 
   public async getProfileName() {
