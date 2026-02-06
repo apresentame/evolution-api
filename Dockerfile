@@ -1,10 +1,9 @@
-FROM node:24-bookworm-slim AS builder
+FROM node:24-alpine AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ffmpeg wget curl bash openssl ca-certificates dos2unix \
- && rm -rf /var/lib/apt/lists/*
+RUN apk update && \
+    apk add --no-cache git ffmpeg wget curl bash openssl
 
-LABEL version="2.3.1" description="Api to control whatsapp features through http requests."
+LABEL version="2.3.1" description="Api to control whatsapp features through http requests." 
 LABEL maintainer="Davidson Gomes" git="https://github.com/DavidsonGomes"
 LABEL contact="contato@evolution-api.com"
 
@@ -22,23 +21,19 @@ COPY ./prisma ./prisma
 COPY ./manager ./manager
 COPY ./.env.example ./.env
 COPY ./runWithProvider.js ./
+
 COPY ./Docker ./Docker
 
 RUN chmod +x ./Docker/scripts/* && dos2unix ./Docker/scripts/*
 
 RUN ./Docker/scripts/generate_database.sh
 
-ENV NODE_OPTIONS="--max-old-space-size=4096"
-ENV ESBUILD_MAX_THREADS=2
-
 RUN npm run build
 
+FROM node:24-alpine AS final
 
-FROM node:24-bookworm-slim AS final
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    tzdata ffmpeg bash openssl ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+RUN apk update && \
+    apk add tzdata ffmpeg bash openssl
 
 ENV TZ=America/Sao_Paulo
 ENV DOCKER_ENV=true
@@ -57,6 +52,8 @@ COPY --from=builder /evolution/.env ./.env
 COPY --from=builder /evolution/Docker ./Docker
 COPY --from=builder /evolution/runWithProvider.js ./runWithProvider.js
 COPY --from=builder /evolution/tsup.config.ts ./tsup.config.ts
+
+ENV DOCKER_ENV=true
 
 EXPOSE 8080
 
