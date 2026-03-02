@@ -1348,10 +1348,62 @@ export class BaileysStartupService extends ChannelStartupService {
 
           this.logger.verbose(messageRaw);
 
-          sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
-          if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
-            messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
+          const msgKey = messageRaw.key as ExtendedIMessageKey & { remoteJidLid?: string };
+          if (typeof msgKey.remoteJid === 'string' && msgKey.remoteJid.includes('@lid')) {
+            const originalLid = msgKey.remoteJid;
+            let normalizedJid: string | null = null;
+
+            if (typeof msgKey.remoteJidAlt === 'string' && !msgKey.remoteJidAlt.includes('@lid')) {
+              normalizedJid = msgKey.remoteJidAlt;
+            } else {
+              try {
+                const resolved = await this.client.signalRepository.lidMapping.getPNForLID(originalLid as string);
+                if (resolved && typeof resolved === 'string') {
+                  normalizedJid = resolved;
+                }
+              } catch (error) {
+                this.logger.error([
+                  'Failed to resolve LID for MESSAGES_UPSERT via lidMapping',
+                  originalLid,
+                  error?.message,
+                ]);
+              }
+
+              if (!normalizedJid) {
+                try {
+                  const cached = await getOnWhatsappCache([originalLid]);
+                  const match = cached?.find((c) => c.jidOptions.includes(originalLid));
+                  if (match) {
+                    normalizedJid = match.remoteJid;
+                  }
+                } catch (error) {
+                  this.logger.error([
+                    'Failed to resolve LID for MESSAGES_UPSERT via cache',
+                    originalLid,
+                    error?.message,
+                  ]);
+                }
+              }
+            }
+
+            if (normalizedJid) {
+              const [numberPart, domainPart] = normalizedJid.split('@');
+              const cleanNumber = numberPart.split(':')[0];
+              const finalJid = domainPart ? `${cleanNumber}@${domainPart}` : `${cleanNumber}@s.whatsapp.net`;
+
+              msgKey.remoteJidLid = originalLid;
+              msgKey.remoteJid = finalJid;
+
+              if (!msgKey.remoteJidAlt || msgKey.remoteJidAlt.includes('@lid')) {
+                msgKey.remoteJidAlt = finalJid;
+              }
+            } else if (msgKey.remoteJidAlt && !msgKey.remoteJidAlt.includes('@lid')) {
+              msgKey.remoteJidLid = originalLid;
+              msgKey.remoteJid = msgKey.remoteJidAlt;
+            }
           }
+
+          sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
           console.log(messageRaw);
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
@@ -1363,8 +1415,9 @@ export class BaileysStartupService extends ChannelStartupService {
             pushName: messageRaw.pushName,
           });
 
+          const contactJid = messageRaw.key.remoteJid;
           const contact = await this.prismaRepository.contact.findFirst({
-            where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
+            where: { remoteJid: contactJid, instanceId: this.instanceId },
           });
 
           const contactRaw: {
@@ -1373,7 +1426,7 @@ export class BaileysStartupService extends ChannelStartupService {
             profilePicUrl?: string;
             instanceId: string;
           } = {
-            remoteJid: received.key.remoteJid,
+            remoteJid: contactJid,
             pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
             profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
             instanceId: this.instanceId,
@@ -1731,14 +1784,53 @@ export class BaileysStartupService extends ChannelStartupService {
         if (events.call) {
           const call = events.call[0];
 
+          if (typeof call.from === 'string' && call.from.endsWith('@lid')) {
+            const originalFrom = call.from;
+            let normalizedFrom: string | null = null;
+
+            try {
+              const resolved = await this.client.signalRepository.lidMapping.getPNForLID(originalFrom as string);
+              if (resolved && typeof resolved === 'string') {
+                normalizedFrom = resolved;
+              }
+            } catch (error) {
+              this.logger.error([
+                'Failed to resolve LID for call webhook via lidMapping',
+                originalFrom,
+                error?.message,
+              ]);
+            }
+
+            if (!normalizedFrom) {
+              try {
+                const cached = await getOnWhatsappCache([originalFrom]);
+                const match = cached?.find((c) => c.jidOptions.includes(originalFrom));
+                if (match) {
+                  normalizedFrom = match.remoteJid;
+                }
+              } catch (error) {
+                this.logger.error(['Failed to resolve LID for call webhook via cache', originalFrom, error?.message]);
+              }
+            }
+
+            if (normalizedFrom) {
+              const [numberPart, domainPart] = normalizedFrom.split('@');
+              const cleanNumber = numberPart.split(':')[0];
+
+              if (domainPart) {
+                normalizedFrom = `${cleanNumber}@${domainPart}`;
+              } else {
+                normalizedFrom = `${cleanNumber}@s.whatsapp.net`;
+              }
+              call.from = normalizedFrom;
+            }
+          }
+
           if (settings?.rejectCall && call.status == 'offer') {
             this.client.rejectCall(call.id, call.from);
           }
 
           if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-            if (call.from.endsWith('@lid')) {
-              call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
-            }
             const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
 
             this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
@@ -4379,11 +4471,39 @@ export class BaileysStartupService extends ChannelStartupService {
   public async findParticipants(id: GroupJid) {
     try {
       const participants = (await this.client.groupMetadata(id.groupJid)).participants;
+
+      // Resolve phoneNumber for each participant (LID -> number via getPNForLID or IsOnWhatsapp cache)
+      const lidJids = participants.filter((p) => p.id.endsWith('@lid')).map((p) => p.id);
+      const cachedLids = lidJids.length > 0 ? await getOnWhatsappCache(lidJids) : [];
+
+      const parsedParticipants = await Promise.all(
+        participants.map(async (participant) => {
+          let phoneNumber: string;
+          if (participant.id.endsWith('@lid')) {
+            try {
+              const resolved = await this.client.signalRepository.lidMapping.getPNForLID(participant.id);
+              phoneNumber = resolved && typeof resolved === 'string' ? resolved : participant.id;
+            } catch {
+              const found = cachedLids.find((c) => c.jidOptions.includes(participant.id));
+              phoneNumber = found ? found.remoteJid : participant.id;
+            }
+            if (!phoneNumber.includes('@')) {
+              phoneNumber = phoneNumber ? `${phoneNumber}@s.whatsapp.net` : participant.id;
+            }
+          } else {
+            phoneNumber = participant.id;
+          }
+          return { ...participant, phoneNumber };
+        }),
+      );
+
+      const contactLookupJids = parsedParticipants.map((p) => p.phoneNumber);
       const contacts = await this.prismaRepository.contact.findMany({
-        where: { instanceId: this.instanceId, remoteJid: { in: participants.map((p) => p.id) } },
+        where: { instanceId: this.instanceId, remoteJid: { in: contactLookupJids } },
       });
-      const parsedParticipants = participants.map((participant) => {
-        const contact = contacts.find((c) => c.remoteJid === participant.id);
+
+      const withContact = parsedParticipants.map((participant) => {
+        const contact = contacts.find((c) => c.remoteJid === participant.phoneNumber);
         return {
           ...participant,
           name: participant.name ?? contact?.pushName,
@@ -4391,14 +4511,14 @@ export class BaileysStartupService extends ChannelStartupService {
         };
       });
 
-      const usersContacts = parsedParticipants.filter((c) => c.id.includes('@s.whatsapp'));
-      if (usersContacts) {
+      const usersContacts = withContact.filter((c) => c.id.includes('@s.whatsapp'));
+      if (usersContacts.length > 0) {
         await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.id })));
       }
 
-      return { participants: parsedParticipants };
+      return { participants: withContact };
     } catch (error) {
-      console.error(error);
+      this.logger.error(error);
       throw new NotFoundException('No participants', error.toString());
     }
   }
