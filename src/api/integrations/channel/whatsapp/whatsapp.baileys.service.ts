@@ -2127,7 +2127,6 @@ export class BaileysStartupService extends ChannelStartupService {
                 }
               }
 
-              console.log('rejection', settings?.rejectCall, call.status);
               if (settings?.rejectCall && call.status == 'offer') {
                 this.client.rejectCall(call.id, call.from);
               }
