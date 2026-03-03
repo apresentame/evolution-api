@@ -2080,10 +2080,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (events.call) {
               const call = events.call[0];
+              let normalizedFrom: string | null = null;
 
               if (typeof call.from === 'string' && call.from.endsWith('@lid')) {
                 const originalFrom = call.from;
-                let normalizedFrom: string | null = null;
 
                 try {
                   const resolved = await this.client.signalRepository.lidMapping.getPNForLID(originalFrom as string);
@@ -2124,12 +2124,16 @@ export class BaileysStartupService extends ChannelStartupService {
                     normalizedFrom = `${cleanNumber}@s.whatsapp.net`;
                   }
                   (call as any).fromLid = originalFrom;
-                  call.from = normalizedFrom;
                 }
               }
 
+              console.log('rejection', settings?.rejectCall, call.status);
               if (settings?.rejectCall && call.status == 'offer') {
                 this.client.rejectCall(call.id, call.from);
+              }
+
+              if (normalizedFrom) {
+                call.from = normalizedFrom;
               }
 
               if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
