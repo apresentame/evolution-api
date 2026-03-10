@@ -713,7 +713,7 @@ export class BusinessStartupService extends ChannelStartupService {
 
         const contactRaw: any = {
           remoteJid:
-            received?.contacts?.length && received.contacts[0].profile
+            received?.contacts?.length && received.contacts[0].profile?.phone
               ? received.contacts[0].profile.phone
               : this.phoneNumber,
           pushName,
