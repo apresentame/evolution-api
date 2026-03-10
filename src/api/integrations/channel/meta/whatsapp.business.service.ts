@@ -395,7 +395,7 @@ export class BusinessStartupService extends ChannelStartupService {
       let messageRaw: any;
       let pushName: any;
 
-      if (received.contacts) pushName = received.contacts[0].profile.name;
+      if (received.contacts?.length) pushName = received.contacts[0]?.profile?.name ?? received.contacts[0]?.wa_id;
 
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
@@ -712,7 +712,10 @@ export class BusinessStartupService extends ChannelStartupService {
         });
 
         const contactRaw: any = {
-          remoteJid: received?.contacts?.length ? received.contacts[0].profile.phone : this.phoneNumber,
+          remoteJid:
+            received?.contacts?.length && received.contacts[0].profile
+              ? received.contacts[0].profile.phone
+              : this.phoneNumber,
           pushName,
           // profilePicUrl: '',
           instanceId: this.instanceId,
