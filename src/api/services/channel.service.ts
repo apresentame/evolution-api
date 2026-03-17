@@ -60,6 +60,7 @@ export class ChannelStartupService {
     this.instance.number = instance.number;
     this.instance.token = instance.token;
     this.instance.businessId = instance.businessId;
+    this.instance.ownerJid = instance.ownerJid;
 
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
       this.chatwootService.eventWhatsapp(
@@ -431,7 +432,13 @@ export class ChannelStartupService {
     return data;
   }
 
-  public async sendDataWebhook<T extends object = any>(event: Events, data: T, local = true, integration?: string[]) {
+  public async sendDataWebhook<T extends object = any>(
+    event: Events,
+    data: T,
+    local = true,
+    integration?: string[],
+    extra?: Record<string, any>,
+  ) {
     const serverUrl = this.configService.get<HttpServer>('SERVER').URL;
     const tzoffset = new Date().getTimezoneOffset() * 60000; //offset in milliseconds
     const localISOTime = new Date(Date.now() - tzoffset).toISOString();
@@ -452,6 +459,7 @@ export class ChannelStartupService {
       apiKey: expose && instanceApikey ? instanceApikey : null,
       local,
       integration,
+      extra,
     });
   }
 
@@ -535,14 +543,12 @@ export class ChannelStartupService {
 
   public cleanMessageData(message: any) {
     if (!message) return message;
-
     const cleanedMessage = { ...message };
 
-    const mediaUrl = cleanedMessage.message.mediaUrl;
-
-    delete cleanedMessage.message.base64;
-
     if (cleanedMessage.message) {
+      const { mediaUrl } = cleanedMessage.message;
+      delete cleanedMessage.message.base64;
+
       // Limpa imageMessage
       if (cleanedMessage.message.imageMessage) {
         cleanedMessage.message.imageMessage = {
@@ -584,9 +590,9 @@ export class ChannelStartupService {
           name: cleanedMessage.message.documentWithCaptionMessage.name,
         };
       }
-    }
 
-    if (mediaUrl) cleanedMessage.message.mediaUrl = mediaUrl;
+      if (mediaUrl) cleanedMessage.message.mediaUrl = mediaUrl;
+    }
 
     return cleanedMessage;
   }
