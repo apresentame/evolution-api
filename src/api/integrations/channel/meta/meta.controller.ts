@@ -13,7 +13,7 @@ export class MetaController extends ChannelController implements ChannelControll
   }
 
   integrationEnabled: boolean;
-
+  //
   public async receiveWebhook(data: any) {
     if (data.object === 'whatsapp_business_account') {
       if (data.entry[0]?.changes[0]?.field === 'message_template_status_update') {
