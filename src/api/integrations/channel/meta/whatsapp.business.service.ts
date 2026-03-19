@@ -131,8 +131,6 @@ export class BusinessStartupService extends ChannelStartupService {
     try {
       this.loadChatwoot();
 
-      this.eventHandler(content);
-
       let phoneNumber = null;
       // get the phone number based on the possible bodies that came from meta webhook
       if (content?.messages?.length && content?.messages[0]?.from) phoneNumber = content.messages[0].from;
@@ -142,6 +140,7 @@ export class BusinessStartupService extends ChannelStartupService {
         phoneNumber = content.message_echoes[0].to;
 
       this.phoneNumber = createJid(phoneNumber);
+      this.eventHandler(content);
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
@@ -399,10 +398,11 @@ export class BusinessStartupService extends ChannelStartupService {
 
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
+        const remoteJid = createJid(message.from || this.phoneNumber);
 
         const key = {
           id: message.id,
-          remoteJid: this.phoneNumber,
+          remoteJid,
           fromMe:
             message.from === received.metadata.phone_number_id ||
             message.from === received.metadata.display_phone_number,
