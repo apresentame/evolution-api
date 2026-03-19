@@ -1,3 +1,4 @@
+import { LidToJidDto } from '@api/dto/chat.dto';
 import { InstanceDto } from '@api/dto/instance.dto';
 import { WAMonitoringService } from '@api/services/monitor.service';
 
@@ -8,6 +9,12 @@ export class BaileysController {
     const instance = this.waMonitor.waInstances[instanceName];
 
     return instance.baileysOnWhatsapp(body?.jid);
+  }
+
+  public async lidToJid({ instanceName }: InstanceDto, data: LidToJidDto) {
+    const instance = this.waMonitor.waInstances[instanceName];
+
+    return instance.lidToJid(data?.lid);
   }
 
   public async profilePictureUrl({ instanceName }: InstanceDto, body: any) {

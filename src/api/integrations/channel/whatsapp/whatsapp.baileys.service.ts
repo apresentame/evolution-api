@@ -1576,7 +1576,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
           this.logger.verbose(messageRaw);
 
-          const msgKey = messageRaw.key as ExtendedIMessageKey & { remoteJidLid?: string };
+          const msgKey = messageRaw.key as ExtendedIMessageKey & {
+            remoteJidLid?: string;
+            originalLid?: string;
+          };
           if (typeof msgKey.remoteJid === 'string' && msgKey.remoteJid.includes('@lid')) {
             const originalLid = msgKey.remoteJid;
             let normalizedJid: string | null = null;
@@ -1620,8 +1623,8 @@ export class BaileysStartupService extends ChannelStartupService {
               const finalJid = domainPart ? `${cleanNumber}@${domainPart}` : `${cleanNumber}@s.whatsapp.net`;
 
               msgKey.remoteJidLid = originalLid;
+              msgKey.originalLid = originalLid;
               msgKey.remoteJid = finalJid;
-
               if (!msgKey.remoteJidAlt || msgKey.remoteJidAlt.includes('@lid')) {
                 msgKey.remoteJidAlt = finalJid;
               }
@@ -2354,6 +2357,20 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     } catch {
       return { wuid: jid, name: null, picture: null, status: null, os: null, isBusiness: false };
+    }
+  }
+
+  public async lidToJid(lid: string): Promise<{ jid: string | null }> {
+    try {
+      const jid = await this.client.signalRepository.lidMapping.getPNForLID(lid);
+
+      if (typeof jid === 'string' && jid.length > 0) {
+        return { jid };
+      }
+
+      return { jid: null };
+    } catch {
+      return { jid: null };
     }
   }
 
