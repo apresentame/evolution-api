@@ -4935,8 +4935,53 @@ export class BaileysStartupService extends ChannelStartupService {
     return obj;
   }
 
+  private extractReplyContextInfo(msg: any): Record<string, unknown> {
+    if (!msg || typeof msg !== 'object') return {};
+
+    const tryDirect = [
+      msg.extendedTextMessage?.contextInfo,
+      msg.imageMessage?.contextInfo,
+      msg.videoMessage?.contextInfo,
+      msg.audioMessage?.contextInfo,
+      msg.documentMessage?.contextInfo,
+      msg.stickerMessage?.contextInfo,
+      msg.contactMessage?.contextInfo,
+      msg.locationMessage?.contextInfo,
+      msg.buttonsMessage?.contextInfo,
+      msg.listMessage?.contextInfo,
+      msg.liveLocationMessage?.contextInfo,
+      msg.documentWithCaptionMessage?.message?.documentMessage?.contextInfo,
+    ];
+
+    for (const ctx of tryDirect) {
+      if (ctx && typeof ctx === 'object' && Object.keys(ctx).length) {
+        return { ...ctx } as Record<string, unknown>;
+      }
+    }
+
+    if (msg.ephemeralMessage?.message) {
+      const nested = this.extractReplyContextInfo(msg.ephemeralMessage.message);
+      if (Object.keys(nested).length) return nested;
+    }
+    if (msg.viewOnceMessage?.message) {
+      const nested = this.extractReplyContextInfo(msg.viewOnceMessage.message);
+      if (Object.keys(nested).length) return nested;
+    }
+    if (msg.viewOnceMessageV2?.message) {
+      const nested = this.extractReplyContextInfo(msg.viewOnceMessageV2.message);
+      if (Object.keys(nested).length) return nested;
+    }
+
+    return {};
+  }
+
   private prepareMessage(message: WAMessage): Message {
     const keyAny = message.key as any;
+
+    const deserializedMsg = this.deserializeMessageBuffers({ ...message.message });
+    const messageContextMeta = this.deserializeMessageBuffers(message.message?.messageContextInfo) || {};
+    const replyContext = this.extractReplyContextInfo(deserializedMsg);
+
     const messageRaw: any = {
       key: {
         ...message.key,
@@ -4948,7 +4993,7 @@ export class BaileysStartupService extends ChannelStartupService {
         (message.key.fromMe
           ? 'Você'
           : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
-      message: this.deserializeMessageBuffers({ ...message.message }),
+      message: deserializedMsg,
       messageType: getContentType(message.message),
       messageTimestamp: Long.isLong(message.messageTimestamp)
         ? message.messageTimestamp.toNumber()
@@ -4956,7 +5001,10 @@ export class BaileysStartupService extends ChannelStartupService {
       source: getDevice(keyAny.id),
       instanceId: this.instanceId,
       status: status[message.status],
-      contextInfo: this.deserializeMessageBuffers(message.message?.messageContextInfo),
+      contextInfo: {
+        ...(typeof messageContextMeta === 'object' && messageContextMeta !== null ? messageContextMeta : {}),
+        ...replyContext,
+      },
     };
 
     if (!messageRaw.status && message.key.fromMe === false) {
