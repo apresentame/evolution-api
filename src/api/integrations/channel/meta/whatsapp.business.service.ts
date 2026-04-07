@@ -400,7 +400,7 @@ export class BusinessStartupService extends ChannelStartupService {
 
         const key = {
           id: message.id,
-          remoteJid: this.phoneNumber,
+          remoteJid: this.phoneNumber || bsuid,
           fromMe: message.from === received.metadata.phone_number_id,
           bsuid, // Business Scoped User ID
           parentBsuid, // Parent Business Scoped User ID
@@ -709,11 +709,14 @@ export class BusinessStartupService extends ChannelStartupService {
           where: { instanceId: this.instanceId, remoteJid: key.remoteJid },
         });
 
+        const contactRemoteJid = received.contacts[0].profile?.phone || this.phoneNumber || bsuid;
+
         const contactRaw: any = {
-          remoteJid: received.contacts[0].profile.phone,
+          remoteJid: contactRemoteJid,
           pushName,
-          // profilePicUrl: '',
           instanceId: this.instanceId,
+          bsuid,
+          parentBsuid,
         };
 
         if (contactRaw.remoteJid === 'status@broadcast') {
@@ -722,9 +725,8 @@ export class BusinessStartupService extends ChannelStartupService {
 
         if (contact) {
           const contactRaw: any = {
-            remoteJid: received.contacts[0].profile.phone,
+            remoteJid: contactRemoteJid,
             pushName,
-            // profilePicUrl: '',
             instanceId: this.instanceId,
             bsuid, // Business Scoped User ID
             parentBsuid, // Parent Business Scoped User ID
