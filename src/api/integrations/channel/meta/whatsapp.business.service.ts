@@ -392,10 +392,18 @@ export class BusinessStartupService extends ChannelStartupService {
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
 
+        let bsuid = null;
+        let parentBsuid = null;
+
+        if (message?.from_user_id) bsuid = message?.from_user_id;
+        if (message?.from_parent_user_id) parentBsuid = message?.from_parent_user_id;
+
         const key = {
           id: message.id,
-          remoteJid: this.phoneNumber,
+          remoteJid: this.phoneNumber || bsuid,
           fromMe: message.from === received.metadata.phone_number_id,
+          bsuid, // Business Scoped User ID
+          parentBsuid, // Parent Business Scoped User ID
         };
 
         if (message.type === 'sticker') {
@@ -701,11 +709,14 @@ export class BusinessStartupService extends ChannelStartupService {
           where: { instanceId: this.instanceId, remoteJid: key.remoteJid },
         });
 
+        const contactRemoteJid = received.contacts[0].profile?.phone || this.phoneNumber || bsuid;
+
         const contactRaw: any = {
-          remoteJid: received.contacts[0].profile.phone,
+          remoteJid: contactRemoteJid,
           pushName,
-          // profilePicUrl: '',
           instanceId: this.instanceId,
+          bsuid,
+          parentBsuid,
         };
 
         if (contactRaw.remoteJid === 'status@broadcast') {
@@ -714,10 +725,11 @@ export class BusinessStartupService extends ChannelStartupService {
 
         if (contact) {
           const contactRaw: any = {
-            remoteJid: received.contacts[0].profile.phone,
+            remoteJid: contactRemoteJid,
             pushName,
-            // profilePicUrl: '',
             instanceId: this.instanceId,
+            bsuid, // Business Scoped User ID
+            parentBsuid, // Parent Business Scoped User ID
           };
 
           this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
