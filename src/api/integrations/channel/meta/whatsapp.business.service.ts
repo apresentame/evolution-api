@@ -392,10 +392,18 @@ export class BusinessStartupService extends ChannelStartupService {
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
 
+        let bsuid = null;
+        let parentBsuid = null;
+
+        if (message?.from_user_id) bsuid = message?.from_user_id;
+        if (message?.from_parent_user_id) parentBsuid = message?.from_parent_user_id;
+
         const key = {
           id: message.id,
           remoteJid: this.phoneNumber,
           fromMe: message.from === received.metadata.phone_number_id,
+          bsuid, // Business Scoped User ID
+          parentBsuid, // Parent Business Scoped User ID
         };
 
         if (message.type === 'sticker') {
@@ -718,6 +726,8 @@ export class BusinessStartupService extends ChannelStartupService {
             pushName,
             // profilePicUrl: '',
             instanceId: this.instanceId,
+            bsuid, // Business Scoped User ID
+            parentBsuid, // Parent Business Scoped User ID
           };
 
           this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
