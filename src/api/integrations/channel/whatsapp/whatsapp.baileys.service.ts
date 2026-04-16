@@ -794,6 +794,7 @@ export class BaileysStartupService extends ChannelStartupService {
       },
     };
 
+    this.isDeleting = false;
     this.endSession = false;
 
     this.client = makeWASocket(socketConfig);
