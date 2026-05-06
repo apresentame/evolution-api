@@ -255,7 +255,20 @@ export class BusinessStartupService extends ChannelStartupService {
 
       // Añadir contexto si existe
       if (message.context) {
-        content = { ...content, contextInfo: { stanzaId: message.context.id } };
+        const contextInfo: any = {};
+
+        // identifica a mensagem que foi respondida com o sticker
+        if (message.context?.id) {
+          contextInfo.stanzaId = message.context.id;
+        }
+
+        // provavelmente esse cenário nao aconteça com stickers
+        // mas para termos garantia que a informação seja recebida de todo modo
+        if (message.context?.referral) {
+          contextInfo.ad_info = message.context.referral;
+        }
+
+        content = { ...content, contextInfo: contextInfo };
       }
 
       return content;
@@ -277,7 +290,19 @@ export class BusinessStartupService extends ChannelStartupService {
     } else {
       content = { conversation: message.text.body };
       if (message.context) {
-        content = { ...content, contextInfo: { stanzaId: message.context.id } };
+        const contextInfo: any = {};
+
+        // mensagem que foi respondida
+        if (message.context?.id) {
+          contextInfo.stanzaId = message.context.id;
+        }
+
+        // aqui realmente extrai a informação relacionada com ads
+        if (message.context?.referral) {
+          contextInfo.ad_info = message.context.referral;
+        }
+
+        content = { ...content, contextInfo: contextInfo };
       }
     }
 
@@ -658,11 +683,13 @@ export class BusinessStartupService extends ChannelStartupService {
             instanceId: this.instanceId,
           };
         } else {
+          const parsedMessage = this.messageTextJson(received);
+
           messageRaw = {
             key,
             pushName,
-            message: this.messageTextJson(received),
-            contextInfo: this.messageTextJson(received)?.contextInfo,
+            message: parsedMessage,
+            contextInfo: parsedMessage?.contextInfo,
             messageType: this.renderMessageType(received.messages[0].type),
             messageTimestamp: parseInt(received.messages[0].timestamp) as number,
             source: 'unknown',
