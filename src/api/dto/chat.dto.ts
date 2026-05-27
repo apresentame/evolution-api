@@ -17,6 +17,10 @@ export class OnWhatsAppDto {
   ) {}
 }
 
+export class LidToJidDto {
+  lid: string;
+}
+
 export class getBase64FromMediaMessageDto {
   message: proto.WebMessageInfo;
   convertToMp4?: boolean;
@@ -128,11 +132,15 @@ export class BlockUserDto {
   status: 'block' | 'unblock';
 }
 
+class DecryptPollVoteMessageKeyDto {
+  id: string;
+}
+
+class DecryptPollVoteMessageDto {
+  key: DecryptPollVoteMessageKeyDto;
+}
+
 export class DecryptPollVoteDto {
-  message: {
-    key: {
-      id: string;
-    };
-  };
+  message: DecryptPollVoteMessageDto;
   remoteJid: string;
 }

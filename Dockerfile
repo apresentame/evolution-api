@@ -28,11 +28,10 @@ RUN chmod +x ./Docker/scripts/* && dos2unix ./Docker/scripts/*
 
 RUN ./Docker/scripts/generate_database.sh
 
-ENV NODE_OPTIONS="--max-old-space-size=4096"
 ENV ESBUILD_MAX_THREADS=2
 
-RUN npm run build
-
+RUN NODE_OPTIONS="--max-old-space-size=4096" npm run typecheck
+RUN NODE_OPTIONS="--max-old-space-size=4096" npm run build
 
 FROM node:24-bookworm-slim AS final
 

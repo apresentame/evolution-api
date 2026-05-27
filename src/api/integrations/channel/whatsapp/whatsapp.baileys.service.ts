@@ -794,6 +794,7 @@ export class BaileysStartupService extends ChannelStartupService {
       },
     };
 
+    this.isDeleting = false;
     this.endSession = false;
 
     this.client = makeWASocket(socketConfig);
@@ -1576,7 +1577,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
           this.logger.verbose(messageRaw);
 
-          const msgKey = messageRaw.key as ExtendedIMessageKey & { remoteJidLid?: string };
+          const msgKey = messageRaw.key as ExtendedIMessageKey & {
+            remoteJidLid?: string;
+            originalLid?: string;
+          };
           if (typeof msgKey.remoteJid === 'string' && msgKey.remoteJid.includes('@lid')) {
             const originalLid = msgKey.remoteJid;
             let normalizedJid: string | null = null;
@@ -1620,8 +1624,8 @@ export class BaileysStartupService extends ChannelStartupService {
               const finalJid = domainPart ? `${cleanNumber}@${domainPart}` : `${cleanNumber}@s.whatsapp.net`;
 
               msgKey.remoteJidLid = originalLid;
+              msgKey.originalLid = originalLid;
               msgKey.remoteJid = finalJid;
-
               if (!msgKey.remoteJidAlt || msgKey.remoteJidAlt.includes('@lid')) {
                 msgKey.remoteJidAlt = finalJid;
               }
@@ -2354,6 +2358,20 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     } catch {
       return { wuid: jid, name: null, picture: null, status: null, os: null, isBusiness: false };
+    }
+  }
+
+  public async lidToJid(lid: string): Promise<{ jid: string | null }> {
+    try {
+      const jid = await this.client.signalRepository.lidMapping.getPNForLID(lid);
+
+      if (typeof jid === 'string' && jid.length > 0) {
+        return { jid };
+      }
+
+      return { jid: null };
+    } catch {
+      return { jid: null };
     }
   }
 
@@ -4935,8 +4953,53 @@ export class BaileysStartupService extends ChannelStartupService {
     return obj;
   }
 
+  private extractReplyContextInfo(msg: any): Record<string, unknown> {
+    if (!msg || typeof msg !== 'object') return {};
+
+    const tryDirect = [
+      msg.extendedTextMessage?.contextInfo,
+      msg.imageMessage?.contextInfo,
+      msg.videoMessage?.contextInfo,
+      msg.audioMessage?.contextInfo,
+      msg.documentMessage?.contextInfo,
+      msg.stickerMessage?.contextInfo,
+      msg.contactMessage?.contextInfo,
+      msg.locationMessage?.contextInfo,
+      msg.buttonsMessage?.contextInfo,
+      msg.listMessage?.contextInfo,
+      msg.liveLocationMessage?.contextInfo,
+      msg.documentWithCaptionMessage?.message?.documentMessage?.contextInfo,
+    ];
+
+    for (const ctx of tryDirect) {
+      if (ctx && typeof ctx === 'object' && Object.keys(ctx).length) {
+        return { ...ctx } as Record<string, unknown>;
+      }
+    }
+
+    if (msg.ephemeralMessage?.message) {
+      const nested = this.extractReplyContextInfo(msg.ephemeralMessage.message);
+      if (Object.keys(nested).length) return nested;
+    }
+    if (msg.viewOnceMessage?.message) {
+      const nested = this.extractReplyContextInfo(msg.viewOnceMessage.message);
+      if (Object.keys(nested).length) return nested;
+    }
+    if (msg.viewOnceMessageV2?.message) {
+      const nested = this.extractReplyContextInfo(msg.viewOnceMessageV2.message);
+      if (Object.keys(nested).length) return nested;
+    }
+
+    return {};
+  }
+
   private prepareMessage(message: WAMessage): Message {
     const keyAny = message.key as any;
+
+    const deserializedMsg = this.deserializeMessageBuffers({ ...message.message });
+    const messageContextMeta = this.deserializeMessageBuffers(message.message?.messageContextInfo) || {};
+    const replyContext = this.extractReplyContextInfo(deserializedMsg);
+
     const messageRaw: any = {
       key: {
         ...message.key,
@@ -4948,7 +5011,7 @@ export class BaileysStartupService extends ChannelStartupService {
         (message.key.fromMe
           ? 'Você'
           : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
-      message: this.deserializeMessageBuffers({ ...message.message }),
+      message: deserializedMsg,
       messageType: getContentType(message.message),
       messageTimestamp: Long.isLong(message.messageTimestamp)
         ? message.messageTimestamp.toNumber()
@@ -4956,7 +5019,10 @@ export class BaileysStartupService extends ChannelStartupService {
       source: getDevice(keyAny.id),
       instanceId: this.instanceId,
       status: status[message.status],
-      contextInfo: this.deserializeMessageBuffers(message.message?.messageContextInfo),
+      contextInfo: {
+        ...(typeof messageContextMeta === 'object' && messageContextMeta !== null ? messageContextMeta : {}),
+        ...replyContext,
+      },
     };
 
     if (!messageRaw.status && message.key.fromMe === false) {

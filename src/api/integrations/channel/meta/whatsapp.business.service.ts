@@ -131,9 +131,16 @@ export class BusinessStartupService extends ChannelStartupService {
     try {
       this.loadChatwoot();
 
-      this.eventHandler(content);
+      let phoneNumber = null;
+      // get the phone number based on the possible bodies that came from meta webhook
+      if (content?.messages?.length && content?.messages[0]?.from) phoneNumber = content.messages[0].from;
+      else if (content?.statuses?.length && content?.statuses[0]?.recipient_id)
+        phoneNumber = content.statuses[0].recipient_id;
+      else if (content?.message_echoes?.length && content?.message_echoes[0]?.from)
+        phoneNumber = content.message_echoes[0].to;
 
-      this.phoneNumber = createJid(content.messages ? content.messages[0].from : content.statuses[0]?.recipient_id);
+      this.phoneNumber = createJid(phoneNumber);
+      this.eventHandler(content);
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
@@ -387,10 +394,13 @@ export class BusinessStartupService extends ChannelStartupService {
       let messageRaw: any;
       let pushName: any;
 
-      if (received.contacts) pushName = received.contacts[0].profile.name;
+      if (received.contacts?.length) pushName = received.contacts[0]?.profile?.name ?? received.contacts[0]?.wa_id;
 
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
+        const remoteJid = createJid(message.from || this.phoneNumber);
+        const fromMe =
+          message.from === received.metadata.phone_number_id || message.from === received.metadata.display_phone_number;
 
         let bsuid = null;
         let parentBsuid = null;
@@ -400,8 +410,8 @@ export class BusinessStartupService extends ChannelStartupService {
 
         const key = {
           id: message.id,
-          remoteJid: this.phoneNumber || bsuid,
-          fromMe: message.from === received.metadata.phone_number_id,
+          remoteJid: remoteJid || bsuid,
+          fromMe,
           bsuid, // Business Scoped User ID
           parentBsuid, // Parent Business Scoped User ID
         };
@@ -709,7 +719,15 @@ export class BusinessStartupService extends ChannelStartupService {
           where: { instanceId: this.instanceId, remoteJid: key.remoteJid },
         });
 
-        const contactRemoteJid = received.contacts[0].profile?.phone || this.phoneNumber || bsuid;
+        let contactRemoteJid: string = '';
+
+        if (received?.contacts?.length) {
+          contactRemoteJid = received.contacts[0].profile?.phone;
+        } else if (bsuid) {
+          contactRemoteJid = bsuid;
+        } else {
+          contactRemoteJid = this.phoneNumber;
+        }
 
         const contactRaw: any = {
           remoteJid: contactRemoteJid,
@@ -914,9 +932,14 @@ export class BusinessStartupService extends ChannelStartupService {
       const database = this.configService.get<Database>('DATABASE');
       const settings = await this.findSettings();
 
-      // Si hay mensajes, verificar primero el tipo
-      if (content.messages && content.messages.length > 0) {
-        const message = content.messages[0];
+      // due to coexistence webhook body, we need to check for two possible scenarios
+      let messages = [];
+      if (content?.messages?.length) messages = content.messages;
+      else if (content?.message_echoes?.length) messages = content.message_echoes;
+
+      // If there are messages, check the type first
+      if (messages.length > 0) {
+        const message = messages[0];
         this.logger.log(`Tipo de mensaje recibido: ${message.type}`);
 
         // Verificamos el tipo de mensaje antes de procesarlo
@@ -934,7 +957,7 @@ export class BusinessStartupService extends ChannelStartupService {
           message.type === 'reaction'
         ) {
           // Procesar el mensaje normalmente
-          this.messageHandle(content, database, settings);
+          this.messageHandle({ ...content, messages }, database, settings);
         } else {
           this.logger.warn(`Tipo de mensaje no reconocido: ${message.type}`);
         }
