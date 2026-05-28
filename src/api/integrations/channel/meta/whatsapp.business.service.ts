@@ -408,7 +408,48 @@ export class BusinessStartupService extends ChannelStartupService {
             message.from === received.metadata.display_phone_number,
         };
 
-        if (message.type === 'sticker') {
+        if (message.type === 'revoke') {
+          const originalMessageId = message.revoke?.original_message_id;
+          if (!originalMessageId) return;
+
+          const deleteKey = {
+            id: originalMessageId,
+            remoteJid,
+            fromMe: key.fromMe,
+          };
+
+          const findMessage = await this.prismaRepository.message.findFirst({
+            where: {
+              instanceId: this.instanceId,
+              key: { path: ['id'], equals: originalMessageId },
+            },
+          });
+
+          this.sendDataWebhook(Events.MESSAGES_DELETE, deleteKey);
+
+          if (findMessage) {
+            const messageUpdate: any = {
+              messageId: findMessage.id,
+              keyId: originalMessageId,
+              remoteJid: deleteKey.remoteJid,
+              fromMe: deleteKey.fromMe,
+              participant: deleteKey.remoteJid,
+              status: 'DELETED',
+              instanceId: this.instanceId,
+            };
+            await this.prismaRepository.messageUpdate.create({ data: messageUpdate });
+          }
+
+          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+            this.chatwootService.eventWhatsapp(
+              Events.MESSAGES_DELETE,
+              { instanceName: this.instance.name, instanceId: this.instanceId },
+              { key: deleteKey },
+            );
+          }
+
+          return;
+        } else if (message.type === 'sticker') {
           this.logger.log('Procesando mensaje de tipo sticker');
           messageRaw = {
             key,
@@ -940,6 +981,8 @@ export class BusinessStartupService extends ChannelStartupService {
           message.type === 'reaction'
         ) {
           // Procesar el mensaje normalmente
+          this.messageHandle({ ...content, messages }, database, settings);
+        } else if (message.type === 'revoke') {
           this.messageHandle({ ...content, messages }, database, settings);
         } else {
           this.logger.warn(`Tipo de mensaje no reconocido: ${message.type}`);
