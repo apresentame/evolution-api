@@ -399,13 +399,21 @@ export class BusinessStartupService extends ChannelStartupService {
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
         const remoteJid = createJid(message.from || this.phoneNumber);
+        const fromMe =
+          message.from === received.metadata.phone_number_id || message.from === received.metadata.display_phone_number;
+
+        let bsuid = null;
+        let parentBsuid = null;
+
+        if (message?.from_user_id) bsuid = message?.from_user_id;
+        if (message?.from_parent_user_id) parentBsuid = message?.from_parent_user_id;
 
         const key = {
           id: message.id,
-          remoteJid,
-          fromMe:
-            message.from === received.metadata.phone_number_id ||
-            message.from === received.metadata.display_phone_number,
+          remoteJid: remoteJid || bsuid,
+          fromMe,
+          bsuid, // Business Scoped User ID
+          parentBsuid, // Parent Business Scoped User ID
         };
 
         if (message.type === 'sticker') {
@@ -711,14 +719,22 @@ export class BusinessStartupService extends ChannelStartupService {
           where: { instanceId: this.instanceId, remoteJid: key.remoteJid },
         });
 
+        let contactRemoteJid: string = '';
+
+        if (received?.contacts?.length) {
+          contactRemoteJid = received.contacts[0].profile?.phone;
+        } else if (bsuid) {
+          contactRemoteJid = bsuid;
+        } else {
+          contactRemoteJid = this.phoneNumber;
+        }
+
         const contactRaw: any = {
-          remoteJid:
-            received?.contacts?.length && received.contacts[0].profile?.phone
-              ? received.contacts[0].profile.phone
-              : this.phoneNumber,
+          remoteJid: contactRemoteJid,
           pushName,
-          // profilePicUrl: '',
           instanceId: this.instanceId,
+          bsuid,
+          parentBsuid,
         };
 
         if (contactRaw.remoteJid === 'status@broadcast') {
@@ -727,10 +743,11 @@ export class BusinessStartupService extends ChannelStartupService {
 
         if (contact) {
           const contactRaw: any = {
-            remoteJid: received?.contacts?.length ? received.contacts[0].profile.phone : this.phoneNumber,
+            remoteJid: contactRemoteJid,
             pushName,
-            // profilePicUrl: '',
             instanceId: this.instanceId,
+            bsuid, // Business Scoped User ID
+            parentBsuid, // Parent Business Scoped User ID
           };
 
           this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
