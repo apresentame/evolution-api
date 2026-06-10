@@ -398,9 +398,9 @@ export class BusinessStartupService extends ChannelStartupService {
 
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
-        const remoteJid = createJid(message.from || this.phoneNumber);
         const fromMe =
           message.from === received.metadata.phone_number_id || message.from === received.metadata.display_phone_number;
+        const remoteJid = createJid(fromMe ? message.to || this.phoneNumber : message.from || this.phoneNumber);
 
         let bsuid = null;
         let parentBsuid = null;
