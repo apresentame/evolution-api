@@ -836,7 +836,18 @@ export class BusinessStartupService extends ChannelStartupService {
             });
 
             if (!findMessage) {
-              return;
+              if (item.errors?.length) {
+                this.sendDataWebhook(Events.MESSAGES_UPDATE, {
+                  keyId: key.id,
+                  remoteJid: key.remoteJid,
+                  fromMe: key.fromMe,
+                  participant: key?.remoteJid,
+                  status: item.status.toUpperCase(),
+                  errors: item.errors,
+                  instanceId: this.instanceId,
+                });
+              }
+              continue;
             }
 
             if (item.message === null && item.status === undefined) {
@@ -874,6 +885,7 @@ export class BusinessStartupService extends ChannelStartupService {
               fromMe: key.fromMe,
               participant: key?.remoteJid,
               status: item.status.toUpperCase(),
+              errors: item.errors?.length ? item.errors : undefined,
               instanceId: this.instanceId,
             };
 
