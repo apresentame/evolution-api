@@ -33,6 +33,8 @@ function formatBRNumber(jid: string) {
 }
 
 export function createJid(number: string): string {
+  if (!number) return null;
+
   number = number.replace(/:\d+/, '');
 
   if (
