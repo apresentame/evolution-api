@@ -188,6 +188,7 @@ model MessageUpdate {
   participant String?  @db.VarChar(100)
   pollUpdates Json?    @db.JsonB
   status      String   @db.VarChar(30)
+  errors      Json?    @db.JsonB
   Message     Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
   messageId   String
   Instance    Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade)

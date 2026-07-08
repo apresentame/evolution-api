@@ -1,8 +1,10 @@
 import { RouterBroker } from '@api/abstract/abstract.router';
+import { LidToJidDto } from '@api/dto/chat.dto';
 import { InstanceDto } from '@api/dto/instance.dto';
 import { HttpStatus } from '@api/routes/index.router';
 import { baileysController } from '@api/server.module';
 import { instanceSchema } from '@validate/instance.schema';
+import { lidToJidSchema } from '@validate/validate.schema';
 import { RequestHandler, Router } from 'express';
 
 export class BaileysRouter extends RouterBroker {
@@ -15,6 +17,16 @@ export class BaileysRouter extends RouterBroker {
           schema: instanceSchema,
           ClassRef: InstanceDto,
           execute: (instance) => baileysController.onWhatsapp(instance, req.body),
+        });
+
+        res.status(HttpStatus.OK).json(response);
+      })
+      .post(this.routerPath('lidToJid'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<LidToJidDto>({
+          request: req,
+          schema: lidToJidSchema,
+          ClassRef: LidToJidDto,
+          execute: (instance, data) => baileysController.lidToJid(instance, data),
         });
 
         res.status(HttpStatus.OK).json(response);

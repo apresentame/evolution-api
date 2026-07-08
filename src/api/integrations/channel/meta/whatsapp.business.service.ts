@@ -131,8 +131,6 @@ export class BusinessStartupService extends ChannelStartupService {
     try {
       this.loadChatwoot();
 
-      this.eventHandler(content);
-
       let phoneNumber = null;
       // get the phone number based on the possible bodies that came from meta webhook
       if (content?.messages?.length && content?.messages[0]?.from) phoneNumber = content.messages[0].from;
@@ -142,6 +140,7 @@ export class BusinessStartupService extends ChannelStartupService {
         phoneNumber = content.message_echoes[0].to;
 
       this.phoneNumber = createJid(phoneNumber);
+      this.eventHandler(content);
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
@@ -422,16 +421,66 @@ export class BusinessStartupService extends ChannelStartupService {
 
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
+        const fromMe =
+          message.from === received.metadata.phone_number_id || message.from === received.metadata.display_phone_number;
+        const remoteJid = createJid(fromMe ? message.to || this.phoneNumber : message.from || this.phoneNumber);
+
+        let bsuid = null;
+        let parentBsuid = null;
+
+        if (message?.from_user_id) bsuid = message?.from_user_id;
+        if (message?.from_parent_user_id) parentBsuid = message?.from_parent_user_id;
 
         const key = {
           id: message.id,
-          remoteJid: this.phoneNumber,
-          fromMe:
-            message.from === received.metadata.phone_number_id ||
-            message.from === received.metadata.display_phone_number,
+          remoteJid: remoteJid || bsuid,
+          fromMe,
+          bsuid, // Business Scoped User ID
+          parentBsuid, // Parent Business Scoped User ID
         };
 
-        if (message.type === 'sticker') {
+        if (message.type === 'revoke') {
+          const originalMessageId = message.revoke?.original_message_id;
+          if (!originalMessageId) return;
+
+          const deleteKey = {
+            id: originalMessageId,
+            remoteJid,
+            fromMe: key.fromMe,
+          };
+
+          const findMessage = await this.prismaRepository.message.findFirst({
+            where: {
+              instanceId: this.instanceId,
+              key: { path: ['id'], equals: originalMessageId },
+            },
+          });
+
+          this.sendDataWebhook(Events.MESSAGES_DELETE, deleteKey);
+
+          if (findMessage) {
+            const messageUpdate: any = {
+              messageId: findMessage.id,
+              keyId: originalMessageId,
+              remoteJid: deleteKey.remoteJid,
+              fromMe: deleteKey.fromMe,
+              participant: deleteKey.remoteJid,
+              status: 'DELETED',
+              instanceId: this.instanceId,
+            };
+            await this.prismaRepository.messageUpdate.create({ data: messageUpdate });
+          }
+
+          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+            this.chatwootService.eventWhatsapp(
+              Events.MESSAGES_DELETE,
+              { instanceName: this.instance.name, instanceId: this.instanceId },
+              { key: deleteKey },
+            );
+          }
+
+          return;
+        } else if (message.type === 'sticker') {
           this.logger.log('Procesando mensaje de tipo sticker');
           messageRaw = {
             key,
@@ -746,14 +795,22 @@ export class BusinessStartupService extends ChannelStartupService {
           where: { instanceId: this.instanceId, remoteJid: key.remoteJid },
         });
 
+        let contactRemoteJid: string = '';
+
+        if (received?.contacts?.length) {
+          contactRemoteJid = received.contacts[0].profile?.phone;
+        } else if (bsuid) {
+          contactRemoteJid = bsuid;
+        } else {
+          contactRemoteJid = this.phoneNumber;
+        }
+
         const contactRaw: any = {
-          remoteJid:
-            received?.contacts?.length && received.contacts[0].profile?.phone
-              ? received.contacts[0].profile.phone
-              : this.phoneNumber,
+          remoteJid: contactRemoteJid,
           pushName,
-          // profilePicUrl: '',
           instanceId: this.instanceId,
+          bsuid,
+          parentBsuid,
         };
 
         if (contactRaw.remoteJid === 'status@broadcast') {
@@ -762,10 +819,11 @@ export class BusinessStartupService extends ChannelStartupService {
 
         if (contact) {
           const contactRaw: any = {
-            remoteJid: received?.contacts?.length ? received.contacts[0].profile.phone : this.phoneNumber,
+            remoteJid: contactRemoteJid,
             pushName,
-            // profilePicUrl: '',
             instanceId: this.instanceId,
+            bsuid, // Business Scoped User ID
+            parentBsuid, // Parent Business Scoped User ID
           };
 
           this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
@@ -813,7 +871,18 @@ export class BusinessStartupService extends ChannelStartupService {
             });
 
             if (!findMessage) {
-              return;
+              if (item.errors?.length) {
+                this.sendDataWebhook(Events.MESSAGES_UPDATE, {
+                  keyId: key.id,
+                  remoteJid: key.remoteJid,
+                  fromMe: key.fromMe,
+                  participant: key?.remoteJid,
+                  status: item.status.toUpperCase(),
+                  errors: item.errors,
+                  instanceId: this.instanceId,
+                });
+              }
+              continue;
             }
 
             if (item.message === null && item.status === undefined) {
@@ -851,6 +920,7 @@ export class BusinessStartupService extends ChannelStartupService {
               fromMe: key.fromMe,
               participant: key?.remoteJid,
               status: item.status.toUpperCase(),
+              errors: item.errors?.length ? item.errors : undefined,
               instanceId: this.instanceId,
             };
 
@@ -976,6 +1046,8 @@ export class BusinessStartupService extends ChannelStartupService {
           message.type === 'template'
         ) {
           // Procesar el mensaje normalmente
+          this.messageHandle({ ...content, messages }, database, settings);
+        } else if (message.type === 'revoke') {
           this.messageHandle({ ...content, messages }, database, settings);
         } else {
           this.logger.warn(`Tipo de mensaje no reconocido: ${message.type}`);
