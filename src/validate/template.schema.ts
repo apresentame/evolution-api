@@ -30,6 +30,7 @@ export const templateSchema: JSONSchema7 = {
     language: { type: 'string' },
     components: { type: 'array' },
     webhookUrl: { type: 'string' },
+    parameterFormat: { type: 'string', enum: ['named', 'positional'] },
   },
   required: ['name', 'category', 'language', 'components'],
   ...isNotEmpty('name', 'category', 'language', 'components'),

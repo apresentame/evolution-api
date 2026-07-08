@@ -55,6 +55,7 @@ export class TemplateService {
         allow_category_change: data.allowCategoryChange,
         language: data.language,
         components: data.components,
+        parameter_format: data.parameterFormat,
       };
 
       const response = await this.requestTemplate(postData, 'POST');

@@ -223,6 +223,29 @@ export class BusinessStartupService extends ChannelStartupService {
     return content;
   }
 
+  private messageTemplateJson(received: any) {
+    const message = received.messages[0];
+    const tpl = message.template;
+    const name = tpl?.name ?? '';
+    const language = tpl?.language;
+    const components = Array.isArray(tpl?.components) ? tpl.components : [];
+
+    let content: any = {
+      templateMessage: {
+        name,
+        ...(language !== undefined ? { language } : {}),
+        components,
+      },
+      ...(name ? { conversation: `▶️${name}◀️` } : {}),
+    };
+
+    if (message.context) {
+      content = { ...content, contextInfo: { stanzaId: message.context.id } };
+    }
+
+    return content;
+  }
+
   private messageTextJson(received: any) {
     // Verificar que received y received.messages existen
     if (!received || !received.messages || received.messages.length === 0) {
@@ -706,6 +729,18 @@ export class BusinessStartupService extends ChannelStartupService {
             source: 'unknown',
             instanceId: this.instanceId,
           };
+        } else if (received?.messages[0].type === 'template') {
+          const templateContent = this.messageTemplateJson(received);
+          messageRaw = {
+            key,
+            pushName,
+            message: templateContent,
+            contextInfo: templateContent?.contextInfo,
+            messageType: 'templateMessage',
+            messageTimestamp: parseInt(received.messages[0].timestamp) as number,
+            source: 'unknown',
+            instanceId: this.instanceId,
+          };
         } else {
           messageRaw = {
             key,
@@ -1007,7 +1042,8 @@ export class BusinessStartupService extends ChannelStartupService {
           message.type === 'contacts' ||
           message.type === 'interactive' ||
           message.type === 'button' ||
-          message.type === 'reaction'
+          message.type === 'reaction' ||
+          message.type === 'template'
         ) {
           // Procesar el mensaje normalmente
           this.messageHandle({ ...content, messages }, database, settings);
@@ -1212,7 +1248,62 @@ export class BusinessStartupService extends ChannelStartupService {
             },
           };
           quoted ? (content.context = { message_id: quoted.id }) : content;
-          message = { conversation: `▶️${message['template']['name']}◀️` };
+
+          const components = message['template']['components'] || [];
+
+          const templateMeta: any = {};
+
+          try {
+            const headerComp = components.find((c: any) => (c.type || '').toString().toUpperCase() === 'HEADER');
+
+            const locParam = headerComp?.parameters?.find(
+              (parameter: any) => (parameter.type || '').toString().toLowerCase() === 'location' && parameter.location,
+            );
+
+            if (locParam?.location) {
+              const loc = locParam.location;
+
+              templateMeta.locationMessage = {
+                degreesLatitude: loc.latitude,
+                degreesLongitude: loc.longitude,
+                name: loc.name,
+                address: loc.address,
+                url: loc.url,
+              };
+            }
+
+            const bodyComp = components.find(
+              (component: any) => (component.type || '').toString().toUpperCase() === 'BODY',
+            );
+
+            const footerComp = components.find(
+              (component: any) => (component.type || '').toString().toUpperCase() === 'FOOTER',
+            );
+
+            const variables: any[] = [];
+
+            if (headerComp?.parameters) {
+              variables.push(
+                ...headerComp.parameters.filter(
+                  (parameter: any) => (parameter.type || '').toString().toLowerCase() === 'text',
+                ),
+              );
+            }
+
+            if (bodyComp?.parameters) variables.push(...bodyComp.parameters);
+
+            if (variables.length) templateMeta.variables = variables;
+
+            if (footerComp?.text) templateMeta.footer = footerComp.text;
+          } catch {
+            // Ignores extra data
+          }
+
+          message = {
+            conversation: `▶️${message['template']['name']}◀️`,
+            ...(Object.keys(templateMeta).length ? { templateMeta } : {}),
+          } as any;
+
           return await this.post(content, 'messages');
         }
       })();

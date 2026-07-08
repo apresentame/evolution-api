@@ -1635,10 +1635,122 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
+          if ((messageRaw as any).contextInfo || (messageRaw as any)?.message?.messageContextInfo) {
+            try {
+              const contextInfo = (messageRaw as any).contextInfo as any;
+              const messageContextInfo = (messageRaw as any)?.message?.messageContextInfo as any;
+
+              const mentionContainer = (
+                contextInfo && Array.isArray(contextInfo.mentionedJid) ? contextInfo : messageContextInfo
+              ) as any;
+
+              if (!mentionContainer) {
+                // Nothing to resolve
+              } else {
+                let mentionedJid: string[] | undefined = mentionContainer?.mentionedJid;
+
+                if (
+                  (!Array.isArray(mentionedJid) || !mentionedJid.length) &&
+                  typeof (messageRaw as any)?.message?.conversation === 'string'
+                ) {
+                  const text = ((messageRaw as any).message.conversation as string) || '';
+
+                  if (text.includes('@')) {
+                    const ids = Array.from(text.matchAll(/@(\d+)/g))
+                      .map((m) => m[1])
+                      .filter(Boolean);
+
+                    if (ids.length) {
+                      mentionedJid = ids.map((id) => `${id}@lid`);
+                      mentionContainer.mentionedJid = mentionedJid;
+                    }
+                  }
+                }
+
+                if (Array.isArray(mentionedJid) && mentionedJid.length) {
+                  const uniqueLids = Array.from(
+                    new Set(mentionedJid.filter((jid) => typeof jid === 'string' && jid.includes('@lid'))),
+                  );
+                  const resolvedMap = new Map<string, string>();
+
+                  await Promise.all(
+                    uniqueLids.map(async (lid) => {
+                      try {
+                        const resolved = await this.client.signalRepository.lidMapping.getPNForLID(lid);
+                        if (resolved && typeof resolved === 'string' && !resolved.includes('@lid')) {
+                          const [numberPart, domainPart] = resolved.split('@');
+                          const cleanNumber = numberPart.split(':')[0];
+
+                          const finalJid = domainPart
+                            ? `${cleanNumber}@${domainPart}`
+                            : `${cleanNumber}@s.whatsapp.net`;
+
+                          if (!finalJid.includes('@lid')) resolvedMap.set(lid, finalJid);
+                        }
+                      } catch (error) {
+                        this.logger.error(['Failed to resolve mentioned LID via lidMapping', lid, error?.message]);
+                      }
+                    }),
+                  );
+
+                  const unresolved = uniqueLids.filter((lid) => !resolvedMap.has(lid));
+
+                  if (unresolved.length) {
+                    try {
+                      const cached = await getOnWhatsappCache(unresolved);
+
+                      for (const lid of unresolved) {
+                        const match = cached?.find((c) => Array.isArray(c.jidOptions) && c.jidOptions.includes(lid));
+                        const normalized = match?.remoteJid;
+
+                        if (normalized && typeof normalized === 'string' && !normalized.includes('@lid')) {
+                          const [numberPart, domainPart] = normalized.split('@');
+                          const cleanNumber = numberPart.split(':')[0];
+
+                          const finalJid = domainPart
+                            ? `${cleanNumber}@${domainPart}`
+                            : `${cleanNumber}@s.whatsapp.net`;
+
+                          if (!finalJid.includes('@lid')) resolvedMap.set(lid, finalJid);
+                        }
+                      }
+                    } catch (error) {
+                      this.logger.error([
+                        'Failed to resolve mentioned LID via cache',
+                        unresolved.join(','),
+                        error?.message,
+                      ]);
+                    }
+                  }
+
+                  mentionContainer.mentionedJidAlt = mentionedJid.map((jid) =>
+                    resolvedMap.get(jid) ? resolvedMap.get(jid) : jid,
+                  );
+                }
+              }
+            } catch (error) {
+              this.logger.error([
+                'Failed to resolve LID mentions for MESSAGES_UPSERT',
+                messageRaw.key.remoteJid,
+                error?.message,
+              ]);
+            }
+          }
+
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
-          console.log(messageRaw);
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
+
+          if (messageRaw.key.remoteJid?.endsWith('@g.us')) {
+            const chat = await this.prismaRepository.chat.findFirst({
+              where: { instanceId: this.instanceId, remoteJid: messageRaw.key.remoteJid },
+              select: { name: true },
+            });
+
+            if (chat?.name) {
+              (messageRaw as any).groupName = chat.name;
+            }
+          }
 
           await chatbotController.emit({
             instance: { instanceName: this.instance.name, instanceId: this.instanceId },
@@ -4995,7 +5107,6 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private prepareMessage(message: WAMessage): Message {
     const keyAny = message.key as any;
-
     const deserializedMsg = this.deserializeMessageBuffers({ ...message.message });
     const messageContextMeta = this.deserializeMessageBuffers(message.message?.messageContextInfo) || {};
     const replyContext = this.extractReplyContextInfo(deserializedMsg);
