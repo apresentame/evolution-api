@@ -71,6 +71,7 @@ import {
   Database,
   Log,
   Openai,
+  Passkey,
   ProviderSession,
   QrCode,
   S3,
@@ -153,6 +154,7 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { PasskeyCeremony } from './passkey/passkey-ceremony.orchestrator';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -246,6 +248,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private authStateProvider: AuthStateProvider;
+  private passkeyCeremony?: PasskeyCeremony;
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
@@ -263,6 +266,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public get connectionStatus() {
     return this.stateConnection;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  public async submitPasskeyResponse(webAuthnResponse: any): Promise<void> {
+    if (!this.passkeyCeremony) throw new Error('passkey ceremony is not enabled for this instance');
+    await this.passkeyCeremony.submitResponse(webAuthnResponse);
+  }
+
+  public async confirmPasskey(): Promise<void> {
+    if (!this.passkeyCeremony) throw new Error('passkey ceremony is not enabled for this instance');
+    await this.passkeyCeremony.confirm();
   }
 
   public async logoutInstance() {
@@ -801,6 +815,19 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
+    }
+
+    if (this.configService.get<Passkey>('PASSKEY').ENABLED) {
+      // deviceType 1 = WhatsApp Web companion (whatsmeow pair-passkey.go); not yet verified against a live prologue_request
+      this.passkeyCeremony = new PasskeyCeremony({
+        sock: this.client,
+        instanceId: this.instanceId,
+        deviceType: 1,
+        logger: this.logger,
+        getCreds: () => this.instance.authState.state.creds,
+        saveCreds: () => this.instance.authState.saveCreds(),
+      });
+      this.passkeyCeremony.attach();
     }
 
     this.eventHandler();
