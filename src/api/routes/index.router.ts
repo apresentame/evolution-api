@@ -6,7 +6,7 @@ import { ChatbotRouter } from '@api/integrations/chatbot/chatbot.router';
 import { EventRouter } from '@api/integrations/event/event.router';
 import { StorageRouter } from '@api/integrations/storage/storage.router';
 import { waMonitor } from '@api/server.module';
-import { configService, Database, Facebook } from '@config/env.config';
+import { configService, Database, Facebook, Passkey } from '@config/env.config';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { NextFunction, Request, Response, Router } from 'express';
 import fs from 'fs';
@@ -19,6 +19,7 @@ import { ChatRouter } from './chat.router';
 import { GroupRouter } from './group.router';
 import { InstanceRouter } from './instance.router';
 import { LabelRouter } from './label.router';
+import { PasskeyRouter } from './passkey.router';
 import { ProxyRouter } from './proxy.router';
 import { MessageRouter } from './sendMessage.router';
 import { SettingsRouter } from './settings.router';
@@ -161,6 +162,10 @@ if (metricsConfig.ENABLED) {
 }
 
 if (!serverConfig.DISABLE_MANAGER) router.use('/manager', new ViewsRouter().router);
+
+// Public passkey ceremony endpoints (token-scoped, no apikey) used by the browser helper extension
+const passkeyConfig = configService.get<Passkey>('PASSKEY');
+if (passkeyConfig.ENABLED) router.use('/', new PasskeyRouter().router);
 
 router.get('/assets/*', (req, res) => {
   const fileName = req.params[0];
