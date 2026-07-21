@@ -190,7 +190,33 @@ export class BusinessStartupService extends ChannelStartupService {
 
   private messageInteractiveJson(received: any) {
     const message = received.messages[0];
-    let content: any = { conversation: message.interactive[message.interactive.type].title };
+    const interactiveType = message.interactive?.type;
+    const reply = message.interactive?.[interactiveType] || {};
+
+    let conversation: string;
+
+    if (interactiveType === 'nfm_reply') {
+      let flowResponse: any = {};
+      try {
+        flowResponse = reply.response_json ? JSON.parse(reply.response_json) : {};
+      } catch (error) {
+        this.logger.error(`Error parsing nfm_reply response_json: ${error}`);
+      }
+
+      const answersText = Object.entries(flowResponse)
+        .filter(
+          ([key, value]) =>
+            key !== 'flow_token' && value !== undefined && value !== null && String(value).trim() !== '',
+        )
+        .map(([key, value]) => `${key}: ${value}`)
+        .join('\n');
+
+      conversation = answersText || 'Resposta enviada.';
+    } else {
+      conversation = reply.title || reply.description || '';
+    }
+
+    let content: any = { conversation, interactiveReplyType: interactiveType };
     message.context ? (content = { ...content, contextInfo: { stanzaId: message.context.id } }) : content;
     return content;
   }
