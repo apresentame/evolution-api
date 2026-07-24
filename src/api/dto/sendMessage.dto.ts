@@ -24,6 +24,8 @@ export class MediaMessage {
   fileName?: string;
   // url or base64
   media: string;
+  // play in loop, mute, no controls (effect "gif") when mediatype = 'video'
+  gifPlayback?: boolean;
 }
 
 export class StatusMessage {
@@ -81,6 +83,8 @@ export class SendMediaDto extends Metadata {
   fileName?: string;
   // url or base64
   media: string;
+  // play in loop, mute, no controls (effect "gif") when mediatype = 'video'
+  gifPlayback?: boolean;
 }
 
 export class SendPtvDto extends Metadata {

@@ -3124,7 +3124,7 @@ export class BaileysStartupService extends ChannelStartupService {
       prepareMedia[mediaType].fileName = mediaMessage.fileName;
 
       if (mediaMessage.mediatype === 'video') {
-        prepareMedia[mediaType].gifPlayback = false;
+        prepareMedia[mediaType].gifPlayback = mediaMessage.gifPlayback === true;
       }
 
       return generateWAMessageFromContent(
