@@ -29,13 +29,7 @@ export class TemplateService {
     this.businessId = getInstance.businessId;
     this.token = getInstance.token;
 
-    const response = await this.requestTemplate({}, 'GET');
-
-    if (!response) {
-      throw new Error('Error to create template');
-    }
-
-    return response.data;
+    return this.requestAllTemplates();
   }
 
   public async create(instance: InstanceDto, data: TemplateDto) {
@@ -58,7 +52,7 @@ export class TemplateService {
         parameter_format: data.parameterFormat,
       };
 
-      const response = await this.requestTemplate(postData, 'POST');
+      const response = await this.requestTemplate(postData);
 
       if (!response || response.error) {
         // If there's an error from WhatsApp API, throw it with the real error data
@@ -160,20 +154,44 @@ export class TemplateService {
     return response;
   }
 
-  private async requestTemplate(data: any, method: string) {
+  private async requestAllTemplates() {
+    const urlServer = this.configService.get<WaBusiness>('WA_BUSINESS').URL;
+    const version = this.configService.get<WaBusiness>('WA_BUSINESS').VERSION;
+    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${this.token}` };
+
+    let url = `${urlServer}/${version}/${this.businessId}/message_templates?limit=100`;
+    const templates: any[] = [];
+
     try {
-      let urlServer = this.configService.get<WaBusiness>('WA_BUSINESS').URL;
+      while (url) {
+        const result = await axios.get(url, { headers });
+        templates.push(...(result.data?.data ?? []));
+        url = result.data?.paging?.next ?? null;
+      }
+
+      return templates;
+    } catch (e) {
+      this.logger.error(
+        'WhatsApp API request error: ' + (e.response?.data ? JSON.stringify(e.response?.data) : e.message),
+      );
+
+      if (e.response?.data) {
+        return e.response.data;
+      }
+
+      throw new Error(`Connection error: ${e.message}`);
+    }
+  }
+
+  private async requestTemplate(data: any) {
+    try {
+      const urlServer = this.configService.get<WaBusiness>('WA_BUSINESS').URL;
       const version = this.configService.get<WaBusiness>('WA_BUSINESS').VERSION;
-      urlServer = `${urlServer}/${version}/${this.businessId}/message_templates`;
+      const url = `${urlServer}/${version}/${this.businessId}/message_templates`;
       const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${this.token}` };
 
-      if (method === 'GET') {
-        const result = await axios.get(urlServer, { headers });
-        return result.data;
-      } else if (method === 'POST') {
-        const result = await axios.post(urlServer, data, { headers });
-        return result.data;
-      }
+      const result = await axios.post(url, data, { headers });
+      return result.data;
     } catch (e) {
       this.logger.error(
         'WhatsApp API request error: ' + (e.response?.data ? JSON.stringify(e.response?.data) : e.message),
