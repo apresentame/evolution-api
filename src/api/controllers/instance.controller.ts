@@ -5,6 +5,7 @@ import { PrismaRepository } from '@api/repository/repository.service';
 import { channelController, eventManager } from '@api/server.module';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
+import { buildPasskeyOpenURL, passkeyCeremonyStore } from '@api/services/passkey-ceremony.store';
 import { SettingsService } from '@api/services/settings.service';
 import { Events, Integration, wa } from '@api/types/wa.types';
 import { Auth, Chatwoot, ConfigService, HttpServer, WaBusiness } from '@config/env.config';
@@ -391,10 +392,20 @@ export class InstanceController {
   }
 
   public async connectionState({ instanceName }: InstanceDto) {
+    const instanceId = this.waMonitor.waInstances[instanceName]?.instanceId;
+    const ceremony = instanceId ? passkeyCeremonyStore.stateByInstance(instanceId) : undefined;
+
     return {
       instance: {
         instanceName: instanceName,
         state: this.waMonitor.waInstances[instanceName]?.connectionStatus?.state,
+        ...(ceremony && {
+          passkey: {
+            stage: ceremony.state.stage,
+            code: ceremony.state.code,
+            url: buildPasskeyOpenURL(ceremony.token),
+          },
+        }),
       },
     };
   }

@@ -131,9 +131,16 @@ export class BusinessStartupService extends ChannelStartupService {
     try {
       this.loadChatwoot();
 
-      this.eventHandler(content);
+      let phoneNumber = null;
+      // get the phone number based on the possible bodies that came from meta webhook
+      if (content?.messages?.length && content?.messages[0]?.from) phoneNumber = content.messages[0].from;
+      else if (content?.statuses?.length && content?.statuses[0]?.recipient_id)
+        phoneNumber = content.statuses[0].recipient_id;
+      else if (content?.message_echoes?.length && content?.message_echoes[0]?.from)
+        phoneNumber = content.message_echoes[0].to;
 
-      this.phoneNumber = createJid(content.messages ? content.messages[0].from : content.statuses[0]?.recipient_id);
+      this.phoneNumber = createJid(phoneNumber);
+      this.eventHandler(content);
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
@@ -213,6 +220,29 @@ export class BusinessStartupService extends ChannelStartupService {
       },
     };
     message.context ? (content = { ...content, contextInfo: { stanzaId: message.context.id } }) : content;
+    return content;
+  }
+
+  private messageTemplateJson(received: any) {
+    const message = received.messages[0];
+    const tpl = message.template;
+    const name = tpl?.name ?? '';
+    const language = tpl?.language;
+    const components = Array.isArray(tpl?.components) ? tpl.components : [];
+
+    let content: any = {
+      templateMessage: {
+        name,
+        ...(language !== undefined ? { language } : {}),
+        components,
+      },
+      ...(name ? { conversation: `▶️${name}◀️` } : {}),
+    };
+
+    if (message.context) {
+      content = { ...content, contextInfo: { stanzaId: message.context.id } };
+    }
+
     return content;
   }
 
@@ -387,18 +417,70 @@ export class BusinessStartupService extends ChannelStartupService {
       let messageRaw: any;
       let pushName: any;
 
-      if (received.contacts) pushName = received.contacts[0].profile.name;
+      if (received.contacts?.length) pushName = received.contacts[0]?.profile?.name ?? received.contacts[0]?.wa_id;
 
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
+        const fromMe =
+          message.from === received.metadata.phone_number_id || message.from === received.metadata.display_phone_number;
+        const remoteJid = createJid(fromMe ? message.to || this.phoneNumber : message.from || this.phoneNumber);
+
+        let bsuid = null;
+        let parentBsuid = null;
+
+        if (message?.from_user_id) bsuid = message?.from_user_id;
+        if (message?.from_parent_user_id) parentBsuid = message?.from_parent_user_id;
 
         const key = {
           id: message.id,
-          remoteJid: this.phoneNumber,
-          fromMe: message.from === received.metadata.phone_number_id,
+          remoteJid: remoteJid || bsuid,
+          fromMe,
+          bsuid, // Business Scoped User ID
+          parentBsuid, // Parent Business Scoped User ID
         };
 
-        if (message.type === 'sticker') {
+        if (message.type === 'revoke') {
+          const originalMessageId = message.revoke?.original_message_id;
+          if (!originalMessageId) return;
+
+          const deleteKey = {
+            id: originalMessageId,
+            remoteJid,
+            fromMe: key.fromMe,
+          };
+
+          const findMessage = await this.prismaRepository.message.findFirst({
+            where: {
+              instanceId: this.instanceId,
+              key: { path: ['id'], equals: originalMessageId },
+            },
+          });
+
+          this.sendDataWebhook(Events.MESSAGES_DELETE, deleteKey);
+
+          if (findMessage) {
+            const messageUpdate: any = {
+              messageId: findMessage.id,
+              keyId: originalMessageId,
+              remoteJid: deleteKey.remoteJid,
+              fromMe: deleteKey.fromMe,
+              participant: deleteKey.remoteJid,
+              status: 'DELETED',
+              instanceId: this.instanceId,
+            };
+            await this.prismaRepository.messageUpdate.create({ data: messageUpdate });
+          }
+
+          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+            this.chatwootService.eventWhatsapp(
+              Events.MESSAGES_DELETE,
+              { instanceName: this.instance.name, instanceId: this.instanceId },
+              { key: deleteKey },
+            );
+          }
+
+          return;
+        } else if (message.type === 'sticker') {
           this.logger.log('Procesando mensaje de tipo sticker');
           messageRaw = {
             key,
@@ -647,6 +729,18 @@ export class BusinessStartupService extends ChannelStartupService {
             source: 'unknown',
             instanceId: this.instanceId,
           };
+        } else if (received?.messages[0].type === 'template') {
+          const templateContent = this.messageTemplateJson(received);
+          messageRaw = {
+            key,
+            pushName,
+            message: templateContent,
+            contextInfo: templateContent?.contextInfo,
+            messageType: 'templateMessage',
+            messageTimestamp: parseInt(received.messages[0].timestamp) as number,
+            source: 'unknown',
+            instanceId: this.instanceId,
+          };
         } else {
           messageRaw = {
             key,
@@ -701,11 +795,22 @@ export class BusinessStartupService extends ChannelStartupService {
           where: { instanceId: this.instanceId, remoteJid: key.remoteJid },
         });
 
+        let contactRemoteJid: string = '';
+
+        if (received?.contacts?.length) {
+          contactRemoteJid = received.contacts[0].profile?.phone;
+        } else if (bsuid) {
+          contactRemoteJid = bsuid;
+        } else {
+          contactRemoteJid = this.phoneNumber;
+        }
+
         const contactRaw: any = {
-          remoteJid: received.contacts[0].profile.phone,
+          remoteJid: contactRemoteJid,
           pushName,
-          // profilePicUrl: '',
           instanceId: this.instanceId,
+          bsuid,
+          parentBsuid,
         };
 
         if (contactRaw.remoteJid === 'status@broadcast') {
@@ -714,10 +819,11 @@ export class BusinessStartupService extends ChannelStartupService {
 
         if (contact) {
           const contactRaw: any = {
-            remoteJid: received.contacts[0].profile.phone,
+            remoteJid: contactRemoteJid,
             pushName,
-            // profilePicUrl: '',
             instanceId: this.instanceId,
+            bsuid, // Business Scoped User ID
+            parentBsuid, // Parent Business Scoped User ID
           };
 
           this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
@@ -765,7 +871,18 @@ export class BusinessStartupService extends ChannelStartupService {
             });
 
             if (!findMessage) {
-              return;
+              if (item.errors?.length) {
+                this.sendDataWebhook(Events.MESSAGES_UPDATE, {
+                  keyId: key.id,
+                  remoteJid: key.remoteJid,
+                  fromMe: key.fromMe,
+                  participant: key?.remoteJid,
+                  status: item.status.toUpperCase(),
+                  errors: item.errors,
+                  instanceId: this.instanceId,
+                });
+              }
+              continue;
             }
 
             if (item.message === null && item.status === undefined) {
@@ -803,6 +920,7 @@ export class BusinessStartupService extends ChannelStartupService {
               fromMe: key.fromMe,
               participant: key?.remoteJid,
               status: item.status.toUpperCase(),
+              errors: item.errors?.length ? item.errors : undefined,
               instanceId: this.instanceId,
             };
 
@@ -902,9 +1020,14 @@ export class BusinessStartupService extends ChannelStartupService {
       const database = this.configService.get<Database>('DATABASE');
       const settings = await this.findSettings();
 
-      // Si hay mensajes, verificar primero el tipo
-      if (content.messages && content.messages.length > 0) {
-        const message = content.messages[0];
+      // due to coexistence webhook body, we need to check for two possible scenarios
+      let messages = [];
+      if (content?.messages?.length) messages = content.messages;
+      else if (content?.message_echoes?.length) messages = content.message_echoes;
+
+      // If there are messages, check the type first
+      if (messages.length > 0) {
+        const message = messages[0];
         this.logger.log(`Tipo de mensaje recibido: ${message.type}`);
 
         // Verificamos el tipo de mensaje antes de procesarlo
@@ -919,10 +1042,13 @@ export class BusinessStartupService extends ChannelStartupService {
           message.type === 'contacts' ||
           message.type === 'interactive' ||
           message.type === 'button' ||
-          message.type === 'reaction'
+          message.type === 'reaction' ||
+          message.type === 'template'
         ) {
           // Procesar el mensaje normalmente
-          this.messageHandle(content, database, settings);
+          this.messageHandle({ ...content, messages }, database, settings);
+        } else if (message.type === 'revoke') {
+          this.messageHandle({ ...content, messages }, database, settings);
         } else {
           this.logger.warn(`Tipo de mensaje no reconocido: ${message.type}`);
         }
@@ -1122,7 +1248,62 @@ export class BusinessStartupService extends ChannelStartupService {
             },
           };
           quoted ? (content.context = { message_id: quoted.id }) : content;
-          message = { conversation: `▶️${message['template']['name']}◀️` };
+
+          const components = message['template']['components'] || [];
+
+          const templateMeta: any = {};
+
+          try {
+            const headerComp = components.find((c: any) => (c.type || '').toString().toUpperCase() === 'HEADER');
+
+            const locParam = headerComp?.parameters?.find(
+              (parameter: any) => (parameter.type || '').toString().toLowerCase() === 'location' && parameter.location,
+            );
+
+            if (locParam?.location) {
+              const loc = locParam.location;
+
+              templateMeta.locationMessage = {
+                degreesLatitude: loc.latitude,
+                degreesLongitude: loc.longitude,
+                name: loc.name,
+                address: loc.address,
+                url: loc.url,
+              };
+            }
+
+            const bodyComp = components.find(
+              (component: any) => (component.type || '').toString().toUpperCase() === 'BODY',
+            );
+
+            const footerComp = components.find(
+              (component: any) => (component.type || '').toString().toUpperCase() === 'FOOTER',
+            );
+
+            const variables: any[] = [];
+
+            if (headerComp?.parameters) {
+              variables.push(
+                ...headerComp.parameters.filter(
+                  (parameter: any) => (parameter.type || '').toString().toLowerCase() === 'text',
+                ),
+              );
+            }
+
+            if (bodyComp?.parameters) variables.push(...bodyComp.parameters);
+
+            if (variables.length) templateMeta.variables = variables;
+
+            if (footerComp?.text) templateMeta.footer = footerComp.text;
+          } catch {
+            // Ignores extra data
+          }
+
+          message = {
+            conversation: `▶️${message['template']['name']}◀️`,
+            ...(Object.keys(templateMeta).length ? { templateMeta } : {}),
+          } as any;
+
           return await this.post(content, 'messages');
         }
       })();

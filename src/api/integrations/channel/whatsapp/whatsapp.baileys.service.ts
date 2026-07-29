@@ -71,6 +71,7 @@ import {
   Database,
   Log,
   Openai,
+  Passkey,
   ProviderSession,
   QrCode,
   S3,
@@ -153,6 +154,7 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { PasskeyCeremony } from './passkey/passkey-ceremony.orchestrator';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -246,6 +248,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private authStateProvider: AuthStateProvider;
+  private passkeyCeremony?: PasskeyCeremony;
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
@@ -263,6 +266,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public get connectionStatus() {
     return this.stateConnection;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  public async submitPasskeyResponse(webAuthnResponse: any): Promise<void> {
+    if (!this.passkeyCeremony) throw new Error('passkey ceremony is not enabled for this instance');
+    await this.passkeyCeremony.submitResponse(webAuthnResponse);
+  }
+
+  public async confirmPasskey(): Promise<void> {
+    if (!this.passkeyCeremony) throw new Error('passkey ceremony is not enabled for this instance');
+    await this.passkeyCeremony.confirm();
   }
 
   public async logoutInstance() {
@@ -794,12 +808,26 @@ export class BaileysStartupService extends ChannelStartupService {
       },
     };
 
+    this.isDeleting = false;
     this.endSession = false;
 
     this.client = makeWASocket(socketConfig);
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
+    }
+
+    if (this.configService.get<Passkey>('PASSKEY').ENABLED) {
+      // deviceType 1 = WhatsApp Web companion (whatsmeow pair-passkey.go); not yet verified against a live prologue_request
+      this.passkeyCeremony = new PasskeyCeremony({
+        sock: this.client,
+        instanceId: this.instanceId,
+        deviceType: 1,
+        logger: this.logger,
+        getCreds: () => this.instance.authState.state.creds,
+        saveCreds: () => this.instance.authState.saveCreds(),
+      });
+      this.passkeyCeremony.attach();
     }
 
     this.eventHandler();
@@ -1576,7 +1604,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
           this.logger.verbose(messageRaw);
 
-          const msgKey = messageRaw.key as ExtendedIMessageKey & { remoteJidLid?: string };
+          const msgKey = messageRaw.key as ExtendedIMessageKey & {
+            remoteJidLid?: string;
+            originalLid?: string;
+          };
           if (typeof msgKey.remoteJid === 'string' && msgKey.remoteJid.includes('@lid')) {
             const originalLid = msgKey.remoteJid;
             let normalizedJid: string | null = null;
@@ -1620,8 +1651,8 @@ export class BaileysStartupService extends ChannelStartupService {
               const finalJid = domainPart ? `${cleanNumber}@${domainPart}` : `${cleanNumber}@s.whatsapp.net`;
 
               msgKey.remoteJidLid = originalLid;
+              msgKey.originalLid = originalLid;
               msgKey.remoteJid = finalJid;
-
               if (!msgKey.remoteJidAlt || msgKey.remoteJidAlt.includes('@lid')) {
                 msgKey.remoteJidAlt = finalJid;
               }
@@ -1631,10 +1662,122 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
+          if ((messageRaw as any).contextInfo || (messageRaw as any)?.message?.messageContextInfo) {
+            try {
+              const contextInfo = (messageRaw as any).contextInfo as any;
+              const messageContextInfo = (messageRaw as any)?.message?.messageContextInfo as any;
+
+              const mentionContainer = (
+                contextInfo && Array.isArray(contextInfo.mentionedJid) ? contextInfo : messageContextInfo
+              ) as any;
+
+              if (!mentionContainer) {
+                // Nothing to resolve
+              } else {
+                let mentionedJid: string[] | undefined = mentionContainer?.mentionedJid;
+
+                if (
+                  (!Array.isArray(mentionedJid) || !mentionedJid.length) &&
+                  typeof (messageRaw as any)?.message?.conversation === 'string'
+                ) {
+                  const text = ((messageRaw as any).message.conversation as string) || '';
+
+                  if (text.includes('@')) {
+                    const ids = Array.from(text.matchAll(/@(\d+)/g))
+                      .map((m) => m[1])
+                      .filter(Boolean);
+
+                    if (ids.length) {
+                      mentionedJid = ids.map((id) => `${id}@lid`);
+                      mentionContainer.mentionedJid = mentionedJid;
+                    }
+                  }
+                }
+
+                if (Array.isArray(mentionedJid) && mentionedJid.length) {
+                  const uniqueLids = Array.from(
+                    new Set(mentionedJid.filter((jid) => typeof jid === 'string' && jid.includes('@lid'))),
+                  );
+                  const resolvedMap = new Map<string, string>();
+
+                  await Promise.all(
+                    uniqueLids.map(async (lid) => {
+                      try {
+                        const resolved = await this.client.signalRepository.lidMapping.getPNForLID(lid);
+                        if (resolved && typeof resolved === 'string' && !resolved.includes('@lid')) {
+                          const [numberPart, domainPart] = resolved.split('@');
+                          const cleanNumber = numberPart.split(':')[0];
+
+                          const finalJid = domainPart
+                            ? `${cleanNumber}@${domainPart}`
+                            : `${cleanNumber}@s.whatsapp.net`;
+
+                          if (!finalJid.includes('@lid')) resolvedMap.set(lid, finalJid);
+                        }
+                      } catch (error) {
+                        this.logger.error(['Failed to resolve mentioned LID via lidMapping', lid, error?.message]);
+                      }
+                    }),
+                  );
+
+                  const unresolved = uniqueLids.filter((lid) => !resolvedMap.has(lid));
+
+                  if (unresolved.length) {
+                    try {
+                      const cached = await getOnWhatsappCache(unresolved);
+
+                      for (const lid of unresolved) {
+                        const match = cached?.find((c) => Array.isArray(c.jidOptions) && c.jidOptions.includes(lid));
+                        const normalized = match?.remoteJid;
+
+                        if (normalized && typeof normalized === 'string' && !normalized.includes('@lid')) {
+                          const [numberPart, domainPart] = normalized.split('@');
+                          const cleanNumber = numberPart.split(':')[0];
+
+                          const finalJid = domainPart
+                            ? `${cleanNumber}@${domainPart}`
+                            : `${cleanNumber}@s.whatsapp.net`;
+
+                          if (!finalJid.includes('@lid')) resolvedMap.set(lid, finalJid);
+                        }
+                      }
+                    } catch (error) {
+                      this.logger.error([
+                        'Failed to resolve mentioned LID via cache',
+                        unresolved.join(','),
+                        error?.message,
+                      ]);
+                    }
+                  }
+
+                  mentionContainer.mentionedJidAlt = mentionedJid.map((jid) =>
+                    resolvedMap.get(jid) ? resolvedMap.get(jid) : jid,
+                  );
+                }
+              }
+            } catch (error) {
+              this.logger.error([
+                'Failed to resolve LID mentions for MESSAGES_UPSERT',
+                messageRaw.key.remoteJid,
+                error?.message,
+              ]);
+            }
+          }
+
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
-          console.log(messageRaw);
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
+
+          if (messageRaw.key.remoteJid?.endsWith('@g.us')) {
+            const chat = await this.prismaRepository.chat.findFirst({
+              where: { instanceId: this.instanceId, remoteJid: messageRaw.key.remoteJid },
+              select: { name: true },
+            });
+
+            if (chat?.name) {
+              (messageRaw as any).groupName = chat.name;
+            }
+          }
 
           await chatbotController.emit({
             instance: { instanceName: this.instance.name, instanceId: this.instanceId },
@@ -2357,6 +2500,20 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  public async lidToJid(lid: string): Promise<{ jid: string | null }> {
+    try {
+      const jid = await this.client.signalRepository.lidMapping.getPNForLID(lid);
+
+      if (typeof jid === 'string' && jid.length > 0) {
+        return { jid };
+      }
+
+      return { jid: null };
+    } catch {
+      return { jid: null };
+    }
+  }
+
   public async offerCall({ number, isVideo, callDuration }: OfferCallDto) {
     const jid = createJid(number);
 
@@ -3074,7 +3231,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const response = await axios.get(mediaMessage.media, config);
 
-          mimetype = response.headers['content-type'];
+          mimetype = response.headers['content-type'] as string;
         }
       }
 
@@ -4935,8 +5092,52 @@ export class BaileysStartupService extends ChannelStartupService {
     return obj;
   }
 
+  private extractReplyContextInfo(msg: any): Record<string, unknown> {
+    if (!msg || typeof msg !== 'object') return {};
+
+    const tryDirect = [
+      msg.extendedTextMessage?.contextInfo,
+      msg.imageMessage?.contextInfo,
+      msg.videoMessage?.contextInfo,
+      msg.audioMessage?.contextInfo,
+      msg.documentMessage?.contextInfo,
+      msg.stickerMessage?.contextInfo,
+      msg.contactMessage?.contextInfo,
+      msg.locationMessage?.contextInfo,
+      msg.buttonsMessage?.contextInfo,
+      msg.listMessage?.contextInfo,
+      msg.liveLocationMessage?.contextInfo,
+      msg.documentWithCaptionMessage?.message?.documentMessage?.contextInfo,
+    ];
+
+    for (const ctx of tryDirect) {
+      if (ctx && typeof ctx === 'object' && Object.keys(ctx).length) {
+        return { ...ctx } as Record<string, unknown>;
+      }
+    }
+
+    if (msg.ephemeralMessage?.message) {
+      const nested = this.extractReplyContextInfo(msg.ephemeralMessage.message);
+      if (Object.keys(nested).length) return nested;
+    }
+    if (msg.viewOnceMessage?.message) {
+      const nested = this.extractReplyContextInfo(msg.viewOnceMessage.message);
+      if (Object.keys(nested).length) return nested;
+    }
+    if (msg.viewOnceMessageV2?.message) {
+      const nested = this.extractReplyContextInfo(msg.viewOnceMessageV2.message);
+      if (Object.keys(nested).length) return nested;
+    }
+
+    return {};
+  }
+
   private prepareMessage(message: WAMessage): Message {
     const keyAny = message.key as any;
+    const deserializedMsg = this.deserializeMessageBuffers({ ...message.message });
+    const messageContextMeta = this.deserializeMessageBuffers(message.message?.messageContextInfo) || {};
+    const replyContext = this.extractReplyContextInfo(deserializedMsg);
+
     const messageRaw: any = {
       key: {
         ...message.key,
@@ -4948,7 +5149,7 @@ export class BaileysStartupService extends ChannelStartupService {
         (message.key.fromMe
           ? 'Você'
           : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
-      message: this.deserializeMessageBuffers({ ...message.message }),
+      message: deserializedMsg,
       messageType: getContentType(message.message),
       messageTimestamp: Long.isLong(message.messageTimestamp)
         ? message.messageTimestamp.toNumber()
@@ -4956,7 +5157,10 @@ export class BaileysStartupService extends ChannelStartupService {
       source: getDevice(keyAny.id),
       instanceId: this.instanceId,
       status: status[message.status],
-      contextInfo: this.deserializeMessageBuffers(message.message?.messageContextInfo),
+      contextInfo: {
+        ...(typeof messageContextMeta === 'object' && messageContextMeta !== null ? messageContextMeta : {}),
+        ...replyContext,
+      },
     };
 
     if (!messageRaw.status && message.key.fromMe === false) {

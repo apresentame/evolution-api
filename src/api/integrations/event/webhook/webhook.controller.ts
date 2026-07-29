@@ -5,7 +5,7 @@ import { wa } from '@api/types/wa.types';
 import { configService, Log, Webhook } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 // import { BadRequestException } from '@exceptions';
-import axios, { AxiosInstance } from 'axios';
+import axios from 'axios';
 import * as jwt from 'jsonwebtoken';
 
 import { EmitData, EventController, EventControllerInterface } from '../event.controller';
@@ -104,56 +104,50 @@ export class WebhookController extends EventController implements EventControlle
 
     if (local && instance?.enabled) {
       if (Array.isArray(webhookLocal) && webhookLocal.includes(we)) {
-        let baseURL: string;
+        const urls = (instance?.url || '')
+          .split(',')
+          .map((u) => u.trim())
+          .filter((u) => regex.test(u));
 
-        if (instance?.webhookByEvents) {
-          baseURL = `${instance?.url}/${transformedWe}`;
-        } else {
-          baseURL = instance?.url;
-        }
+        const enhancedHeaders = {
+          ...webhookHeaders,
+          'Content-Type': 'application/json',
+          'X-Instance-ID': this.monitor.waInstances[instanceName].instanceId,
+          'X-Instance-Name': instanceName,
+          'X-Event-Type': event,
+          'X-Timestamp': Date.now().toString(),
+          'User-Agent': 'EvolutionAPI-Webhook/2.3.7',
+        };
+
+        const resolvedUrls = urls.map((u, i) => (i === 0 && instance?.webhookByEvents ? `${u}/${transformedWe}` : u));
 
         if (enabledLog) {
-          const logData = {
+          this.logger.log({
             local: `${origin}.sendData-Webhook`,
-            url: baseURL,
+            urls: resolvedUrls,
             ...webhookData,
-          };
-
-          this.logger.log(logData);
+          });
         }
 
         try {
-          if (instance?.enabled && regex.test(instance.url)) {
-            // Add custom headers for better webhook tracking and debugging
-            const enhancedHeaders = {
-              ...webhookHeaders,
-              'Content-Type': 'application/json',
-              'X-Instance-ID': this.monitor.waInstances[instanceName].instanceId,
-              'X-Instance-Name': instanceName,
-              'X-Event-Type': event,
-              'X-Timestamp': Date.now().toString(),
-              'User-Agent': 'EvolutionAPI-Webhook/2.3.7',
-            };
-
-            const httpService = axios.create({
-              baseURL,
-              headers: enhancedHeaders as Record<string, string>,
-              timeout: webhookConfig.REQUEST?.TIMEOUT_MS ?? 30000,
-            });
-
-            await this.retryWebhookRequest(httpService, webhookData, `${origin}.sendData-Webhook`, baseURL, serverUrl);
-          }
+          await this.retryWebhookRequest(
+            webhookData,
+            `${origin}.sendData-Webhook`,
+            resolvedUrls,
+            enhancedHeaders as Record<string, string>,
+            serverUrl,
+          );
         } catch (error) {
           this.logger.error({
             local: `${origin}.sendData-Webhook`,
-            message: `Todas as tentativas falharam: ${error?.message}`,
+            message: `Todas as tentativas falharam em todas as URLs: ${error?.message}`,
             hostName: error?.hostname,
             syscall: error?.syscall,
             code: error?.code,
             error: error?.errno,
             stack: error?.stack,
             name: error?.name,
-            url: baseURL,
+            urls: resolvedUrls,
             server_url: serverUrl,
           });
         }
@@ -180,16 +174,11 @@ export class WebhookController extends EventController implements EventControlle
 
         try {
           if (regex.test(globalURL)) {
-            const httpService = axios.create({
-              baseURL: globalURL,
-              timeout: webhookConfig.REQUEST?.TIMEOUT_MS ?? 30000,
-            });
-
             await this.retryWebhookRequest(
-              httpService,
               webhookData,
               `${origin}.sendData-Webhook-Global`,
-              globalURL,
+              [globalURL],
+              {},
               serverUrl,
             );
           }
@@ -212,10 +201,10 @@ export class WebhookController extends EventController implements EventControlle
   }
 
   private async retryWebhookRequest(
-    httpService: AxiosInstance,
     webhookData: any,
     origin: string,
-    baseURL: string,
+    urls: string[],
+    headers: Record<string, string>,
     serverUrl: string,
     maxRetries?: number,
     delaySeconds?: number,
@@ -227,39 +216,67 @@ export class WebhookController extends EventController implements EventControlle
     const maxDelay = webhookConfig.RETRY?.MAX_DELAY_SECONDS ?? 300;
     const jitterFactor = webhookConfig.RETRY?.JITTER_FACTOR ?? 0.2;
     const nonRetryableStatusCodes = webhookConfig.RETRY?.NON_RETRYABLE_STATUS_CODES ?? [400, 401, 403, 404, 422];
+    const timeout = webhookConfig.REQUEST?.TIMEOUT_MS ?? 30000;
 
+    let pendingUrls = [...urls];
     let attempts = 0;
 
-    while (attempts < maxRetryAttempts) {
-      try {
-        await httpService.post('', webhookData);
-        if (attempts > 0) {
-          this.logger.log({
-            local: `${origin}`,
-            message: `Sucesso no envio após ${attempts + 1} tentativas`,
-            url: baseURL,
-          });
+    while (pendingUrls.length > 0 && attempts < maxRetryAttempts) {
+      if (attempts > 0) {
+        let nextDelay = initialDelay;
+        if (useExponentialBackoff) {
+          nextDelay = Math.min(initialDelay * Math.pow(2, attempts - 1), maxDelay);
+          const jitter = nextDelay * jitterFactor * (Math.random() * 2 - 1);
+          nextDelay = Math.max(initialDelay, nextDelay + jitter);
         }
-        return;
-      } catch (error) {
-        attempts++;
 
+        this.logger.log({
+          local: origin,
+          message: `Aguardando ${nextDelay.toFixed(1)}s antes da tentativa ${attempts + 1}/${maxRetryAttempts} (${pendingUrls.length} URL(s) pendente(s))`,
+          pendingUrls,
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, nextDelay * 1000));
+      }
+
+      const results = await Promise.allSettled(
+        pendingUrls.map((url) => axios.post(url, webhookData, { headers, timeout })),
+      );
+
+      const stillPending: string[] = [];
+
+      for (let i = 0; i < results.length; i++) {
+        const result = results[i];
+        const url = pendingUrls[i];
+
+        if (result.status === 'fulfilled') {
+          if (attempts > 0) {
+            this.logger.log({
+              local: origin,
+              message: `Sucesso no envio após ${attempts + 1} tentativas`,
+              url,
+            });
+          }
+          continue;
+        }
+
+        const error = result.reason;
         const isTimeout = error.code === 'ECONNABORTED';
 
         if (error?.response?.status && nonRetryableStatusCodes.includes(error.response.status)) {
           this.logger.error({
-            local: `${origin}`,
-            message: `Erro não recuperável (${error.response.status}): ${error?.message}. Cancelando retentativas.`,
+            local: origin,
+            message: `Erro não recuperável (${error.response.status}): ${error?.message}. Cancelando retentativas para esta URL.`,
             statusCode: error?.response?.status,
-            url: baseURL,
+            url,
             server_url: serverUrl,
           });
-          throw error;
+          continue;
         }
 
         this.logger.error({
-          local: `${origin}`,
-          message: `Tentativa ${attempts}/${maxRetryAttempts} falhou: ${isTimeout ? 'Timeout da requisição' : error?.message}`,
+          local: origin,
+          message: `Tentativa ${attempts + 1}/${maxRetryAttempts} falhou para ${url}: ${isTimeout ? 'Timeout da requisição' : error?.message}`,
           hostName: error?.hostname,
           syscall: error?.syscall,
           code: error?.code,
@@ -268,30 +285,21 @@ export class WebhookController extends EventController implements EventControlle
           error: error?.errno,
           stack: error?.stack,
           name: error?.name,
-          url: baseURL,
+          url,
           server_url: serverUrl,
         });
 
-        if (attempts === maxRetryAttempts) {
-          throw error;
-        }
-
-        let nextDelay = initialDelay;
-        if (useExponentialBackoff) {
-          nextDelay = Math.min(initialDelay * Math.pow(2, attempts - 1), maxDelay);
-
-          const jitter = nextDelay * jitterFactor * (Math.random() * 2 - 1);
-          nextDelay = Math.max(initialDelay, nextDelay + jitter);
-        }
-
-        this.logger.log({
-          local: `${origin}`,
-          message: `Aguardando ${nextDelay.toFixed(1)} segundos antes da próxima tentativa`,
-          url: baseURL,
-        });
-
-        await new Promise((resolve) => setTimeout(resolve, nextDelay * 1000));
+        stillPending.push(url);
       }
+
+      attempts++;
+      pendingUrls = stillPending;
+    }
+
+    if (pendingUrls.length > 0) {
+      throw new Error(
+        `Falha ao entregar para ${pendingUrls.length} URL(s) após ${attempts} tentativas: ${pendingUrls.join(', ')}`,
+      );
     }
   }
 
