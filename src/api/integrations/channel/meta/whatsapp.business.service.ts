@@ -23,6 +23,7 @@ import { Events, wa } from '@api/types/wa.types';
 import { AudioConverter, Chatwoot, ConfigService, Database, Openai, S3, WaBusiness } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException } from '@exceptions';
 import { createJid } from '@utils/createJid';
+import { isBsuid } from '@utils/isBsuid';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import axios from 'axios';
@@ -851,10 +852,15 @@ export class BusinessStartupService extends ChannelStartupService {
       }
       if (received.statuses) {
         for await (const item of received.statuses) {
+          const statusBsuid = item.recipient_user_id ?? null;
+          const statusParentBsuid = item.recipient_parent_user_id ?? null;
+
           const key = {
             id: item.id,
-            remoteJid: this.phoneNumber,
+            remoteJid: statusBsuid ?? this.phoneNumber,
             fromMe: this.phoneNumber === received.metadata.phone_number_id,
+            ...(statusBsuid && { bsuid: statusBsuid }),
+            ...(statusParentBsuid && { parentBsuid: statusParentBsuid }),
           };
           if (settings?.groups_ignore && key.remoteJid.includes('@g.us')) {
             return;
@@ -1083,14 +1089,18 @@ export class BusinessStartupService extends ChannelStartupService {
         webhookUrl = options.webhookUrl;
       }
 
+      const bsuidRecipient = isBsuid(number);
+      const recipientField = bsuidRecipient
+        ? { recipient_type: 'individual', recipient: number }
+        : { recipient_type: 'individual', to: number.replace(/\D/g, '') };
+
       let content: any;
       const messageSent = await (async () => {
         if (message['reactionMessage']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
+            ...recipientField,
             type: 'reaction',
-            to: number.replace(/\D/g, ''),
             reaction: {
               message_id: message['reactionMessage']['key']['id'],
               emoji: message['reactionMessage']['text'],
@@ -1102,9 +1112,8 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['locationMessage']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
+            ...recipientField,
             type: 'location',
-            to: number.replace(/\D/g, ''),
             location: {
               longitude: message['locationMessage']['degreesLongitude'],
               latitude: message['locationMessage']['degreesLatitude'],
@@ -1118,9 +1127,8 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['contacts']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
+            ...recipientField,
             type: 'contacts',
-            to: number.replace(/\D/g, ''),
             contacts: message['contacts'],
           };
           quoted ? (content.context = { message_id: quoted.id }) : content;
@@ -1130,9 +1138,8 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['conversation']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
+            ...recipientField,
             type: 'text',
-            to: number.replace(/\D/g, ''),
             text: {
               body: message['conversation'],
               preview_url: Boolean(options?.linkPreview),
@@ -1146,9 +1153,8 @@ export class BusinessStartupService extends ChannelStartupService {
 
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
+            ...recipientField,
             type: message['mediaType'],
-            to: number.replace(/\D/g, ''),
             [message['mediaType']]: {
               [message['type']]: message['id'],
               ...(message['mediaType'] !== 'audio' &&
@@ -1164,9 +1170,8 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['audio']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
+            ...recipientField,
             type: 'audio',
-            to: number.replace(/\D/g, ''),
             audio: {
               [message['type']]: message['id'],
             },
@@ -1177,8 +1182,7 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['buttons']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to: number.replace(/\D/g, ''),
+            ...recipientField,
             type: 'interactive',
             interactive: {
               type: 'button',
@@ -1201,8 +1205,7 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['listMessage']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to: number.replace(/\D/g, ''),
+            ...recipientField,
             type: 'interactive',
             interactive: {
               type: 'list',
@@ -1236,8 +1239,7 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['template']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to: number.replace(/\D/g, ''),
+            ...recipientField,
             type: 'template',
             template: {
               name: message['template']['name'],
@@ -1314,7 +1316,7 @@ export class BusinessStartupService extends ChannelStartupService {
       }
 
       const messageRaw: any = {
-        key: { fromMe: true, id: messageSent?.messages[0]?.id, remoteJid: createJid(number) },
+        key: { fromMe: true, id: messageSent?.messages[0]?.id, remoteJid: bsuidRecipient ? number : createJid(number) },
         message: this.convertMessageToRaw(message, content),
         messageType: this.renderMessageType(content.type),
         messageTimestamp: (messageSent?.messages[0]?.timestamp as number) || Math.round(new Date().getTime() / 1000),
