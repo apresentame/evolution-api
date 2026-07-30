@@ -1929,6 +1929,8 @@ export class BaileysStartupService extends ChannelStartupService {
             status: status[update.status] ?? 'SERVER_ACK',
             pollUpdates,
             instanceId: this.instanceId,
+            messageStubType: update.messageStubType,
+            messageStubParameters: update.messageStubParameters,
           };
 
           if (update.message) {
