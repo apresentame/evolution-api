@@ -83,9 +83,11 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
+import { getAvailableNumbers } from '@utils/getAvailableNumbers';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
-import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
+import { getOnWhatsappCache, removeOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
+import { resolveWhatsappJid } from '@utils/resolveWhatsappJid';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
 import { AuthStateProvider } from '@utils/use-multi-file-auth-state-provider-files';
@@ -2695,6 +2697,10 @@ export class BaileysStartupService extends ChannelStartupService {
   ) {
     const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
 
+    if (!isWA) {
+      throw new BadRequestException(`Number ${number} could not be resolved`);
+    }
+
     if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast')) {
       throw new BadRequestException(isWA);
     }
@@ -2959,6 +2965,13 @@ export class BaileysStartupService extends ChannelStartupService {
       return messageRaw;
     } catch (error) {
       this.logger.error(error);
+
+      // The resolved jid is the prime suspect when a send fails, and a cached one would be replayed
+      // on every retry until it expires. Dropping it makes the next attempt ask the server again.
+      if (isPnUser(sender) || sender.includes('@lid')) {
+        await removeOnWhatsappCache(sender);
+      }
+
       throw new BadRequestException(error.toString());
     }
   }
@@ -2969,6 +2982,10 @@ export class BaileysStartupService extends ChannelStartupService {
       const { number } = data;
 
       const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
+
+      if (!isWA) {
+        throw new BadRequestException(`Number ${number} could not be resolved`);
+      }
 
       if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast')) {
         throw new BadRequestException(isWA);
@@ -3970,11 +3987,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // Separate numbers that are and are not in cache
     const cachedJids = new Set(cachedNumbers.flatMap((cached) => cached.jidOptions));
-    const numbersNotInCache = numbersToVerify.filter((jid) => !cachedJids.has(jid));
+    const numbersNotInCache = numbersToVerify.filter(
+      (jid) => !getAvailableNumbers(jid).some((variant) => cachedJids.has(variant)),
+    );
 
-    // Only call Baileys for normal numbers (@s.whatsapp.net) that are not in cache
+    // Only call Baileys for normal numbers (@s.whatsapp.net) that are not in cache.
+    // Every accepted variant is queried at once, because the registered form is the server's call:
+    // asking only for the variant we guessed is what makes a valid number look non-existent.
     let verify: { jid: string; exists: boolean }[] = [];
-    const normalNumbersNotInCache = numbersNotInCache.filter((jid) => !jid.includes('@lid'));
+    const normalNumbersNotInCache = [
+      ...new Set(numbersNotInCache.filter((jid) => !jid.includes('@lid')).flatMap((jid) => getAvailableNumbers(jid))),
+    ];
 
     if (normalNumbersNotInCache.length > 0) {
       this.logger.verbose(`Checking ${normalNumbersNotInCache.length} numbers via Baileys (not found in cache)`);
@@ -3983,8 +4006,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const verifiedUsers = await Promise.all(
       jids.users.map(async (user) => {
+        const userJid = user.jid.replace('+', '');
+        const variants = getAvailableNumbers(userJid);
+
         // Try to get from cache first (works for all: normal and LID)
-        const cached = cachedNumbers.find((cached) => cached.jidOptions.includes(user.jid.replace('+', '')));
+        const cached = cachedNumbers.find((cached) => cached.jidOptions.some((option) => variants.includes(option)));
 
         if (cached) {
           this.logger.verbose(`Number ${user.number} found in cache`);
@@ -3997,8 +4023,16 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        // If it's a LID number and not in cache, consider it valid
-        if (user.jid.includes('@lid')) {
+        // Baileys refuses LIDs on onWhatsApp, so there is no way to verify them through usync.
+        // The mapping to a phone number is the only signal available, and its absence is worth a log:
+        // the number is still trusted, as it was before, but silently this time.
+        if (userJid.includes('@lid')) {
+          const { jid: mappedJid } = await this.lidToJid(userJid);
+
+          if (!mappedJid) {
+            this.logger.warn(`LID ${userJid} could not be mapped to a phone number, assuming it exists`);
+          }
+
           return new OnWhatsAppDto(
             user.jid,
             true,
@@ -4008,55 +4042,14 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        // If not in cache and is a normal number, use Baileys verification
-        let numberVerified: (typeof verify)[0] | null = null;
-
-        // Brazilian numbers
-        if (user.number.startsWith('55')) {
-          const numberWithDigit =
-            user.number.slice(4, 5) === '9' && user.number.length === 13
-              ? user.number
-              : `${user.number.slice(0, 4)}9${user.number.slice(4)}`;
-          const numberWithoutDigit =
-            user.number.length === 12 ? user.number : user.number.slice(0, 4) + user.number.slice(5);
-
-          numberVerified = verify.find(
-            (v) => v.jid === `${numberWithDigit}@s.whatsapp.net` || v.jid === `${numberWithoutDigit}@s.whatsapp.net`,
-          );
-        }
-
-        // Mexican/Argentina numbers
-        // Ref: https://faq.whatsapp.com/1294841057948784
-        if (!numberVerified && (user.number.startsWith('52') || user.number.startsWith('54'))) {
-          let prefix = '';
-          if (user.number.startsWith('52')) {
-            prefix = '1';
-          }
-          if (user.number.startsWith('54')) {
-            prefix = '9';
-          }
-
-          const numberWithDigit =
-            user.number.slice(2, 3) === prefix && user.number.length === 13
-              ? user.number
-              : `${user.number.slice(0, 2)}${prefix}${user.number.slice(2)}`;
-          const numberWithoutDigit =
-            user.number.length === 12 ? user.number : user.number.slice(0, 2) + user.number.slice(3);
-
-          numberVerified = verify.find(
-            (v) => v.jid === `${numberWithDigit}@s.whatsapp.net` || v.jid === `${numberWithoutDigit}@s.whatsapp.net`,
-          );
-        }
-
-        if (!numberVerified) {
-          numberVerified = verify.find((v) => v.jid === user.jid);
-        }
-
-        const numberJid = numberVerified?.jid || user.jid;
+        // If not in cache and is a normal number, use Baileys verification.
+        // The server answer is the authority on both existence and canonical form, so it is adopted
+        // as is instead of being matched against the jid we guessed.
+        const { jid: numberJid, exists } = resolveWhatsappJid(userJid, verify);
 
         return new OnWhatsAppDto(
           numberJid,
-          !!numberVerified?.exists,
+          exists,
           user.number,
           contacts.find((c) => c.remoteJid === numberJid)?.pushName,
           undefined,
@@ -4071,7 +4064,8 @@ export class BaileysStartupService extends ChannelStartupService {
     const numbersToCache = onWhatsapp.filter((user) => {
       if (!user.exists) return false;
       // Verifica se estava no cache usando jidOptions
-      const cached = cachedNumbers?.find((cached) => cached.jidOptions.includes(user.jid.replace('+', '')));
+      const variants = getAvailableNumbers(user.jid.replace('+', ''));
+      const cached = cachedNumbers?.find((cached) => cached.jidOptions.some((option) => variants.includes(option)));
       return !cached;
     });
 
