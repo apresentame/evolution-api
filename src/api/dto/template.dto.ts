@@ -5,6 +5,7 @@ export class TemplateDto {
   language: string;
   components: any;
   webhookUrl?: string;
+  parameterFormat?: 'named' | 'positional';
 }
 
 export class TemplateEditDto {

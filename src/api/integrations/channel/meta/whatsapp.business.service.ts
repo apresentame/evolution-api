@@ -23,6 +23,7 @@ import { Events, wa } from '@api/types/wa.types';
 import { AudioConverter, Chatwoot, ConfigService, Database, Openai, S3, WaBusiness } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException } from '@exceptions';
 import { createJid } from '@utils/createJid';
+import { isBsuid } from '@utils/isBsuid';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import axios from 'axios';
@@ -197,7 +198,33 @@ export class BusinessStartupService extends ChannelStartupService {
 
   private messageInteractiveJson(received: any) {
     const message = received.messages[0];
-    let content: any = { conversation: message.interactive[message.interactive.type].title };
+    const interactiveType = message.interactive?.type;
+    const reply = message.interactive?.[interactiveType] || {};
+
+    let conversation: string;
+
+    if (interactiveType === 'nfm_reply') {
+      let flowResponse: any = {};
+      try {
+        flowResponse = reply.response_json ? JSON.parse(reply.response_json) : {};
+      } catch (error) {
+        this.logger.error(`Error parsing nfm_reply response_json: ${error}`);
+      }
+
+      const answersText = Object.entries(flowResponse)
+        .filter(
+          ([key, value]) =>
+            key !== 'flow_token' && value !== undefined && value !== null && String(value).trim() !== '',
+        )
+        .map(([key, value]) => `${key}: ${value}`)
+        .join('\n');
+
+      conversation = answersText || 'Resposta enviada.';
+    } else {
+      conversation = reply.title || reply.description || '';
+    }
+
+    let content: any = { conversation, interactiveReplyType: interactiveType };
     message.context ? (content = { ...content, contextInfo: { stanzaId: message.context.id } }) : content;
     return content;
   }
@@ -220,6 +247,29 @@ export class BusinessStartupService extends ChannelStartupService {
       },
     };
     message.context ? (content = { ...content, contextInfo: { stanzaId: message.context.id } }) : content;
+    return content;
+  }
+
+  private messageTemplateJson(received: any) {
+    const message = received.messages[0];
+    const tpl = message.template;
+    const name = tpl?.name ?? '';
+    const language = tpl?.language;
+    const components = Array.isArray(tpl?.components) ? tpl.components : [];
+
+    let content: any = {
+      templateMessage: {
+        name,
+        ...(language !== undefined ? { language } : {}),
+        components,
+      },
+      ...(name ? { conversation: `▶️${name}◀️` } : {}),
+    };
+
+    if (message.context) {
+      content = { ...content, contextInfo: { stanzaId: message.context.id } };
+    }
+
     return content;
   }
 
@@ -731,6 +781,18 @@ export class BusinessStartupService extends ChannelStartupService {
             source: 'unknown',
             instanceId: this.instanceId,
           };
+        } else if (received?.messages[0].type === 'template') {
+          const templateContent = this.messageTemplateJson(received);
+          messageRaw = {
+            key,
+            pushName,
+            message: templateContent,
+            contextInfo: templateContent?.contextInfo,
+            messageType: 'templateMessage',
+            messageTimestamp: parseInt(received.messages[0].timestamp) as number,
+            source: 'unknown',
+            instanceId: this.instanceId,
+          };
         } else {
           const parsedMessage = this.messageTextJson(received);
 
@@ -843,10 +905,15 @@ export class BusinessStartupService extends ChannelStartupService {
       }
       if (received.statuses) {
         for await (const item of received.statuses) {
+          const statusBsuid = item.recipient_user_id ?? null;
+          const statusParentBsuid = item.recipient_parent_user_id ?? null;
+
           const key = {
             id: item.id,
-            remoteJid: this.phoneNumber,
+            remoteJid: statusBsuid ?? this.phoneNumber,
             fromMe: this.phoneNumber === received.metadata.phone_number_id,
+            ...(statusBsuid && { bsuid: statusBsuid }),
+            ...(statusParentBsuid && { parentBsuid: statusParentBsuid }),
           };
           if (settings?.groups_ignore && key.remoteJid.includes('@g.us')) {
             return;
@@ -863,7 +930,18 @@ export class BusinessStartupService extends ChannelStartupService {
             });
 
             if (!findMessage) {
-              return;
+              if (item.errors?.length) {
+                this.sendDataWebhook(Events.MESSAGES_UPDATE, {
+                  keyId: key.id,
+                  remoteJid: key.remoteJid,
+                  fromMe: key.fromMe,
+                  participant: key?.remoteJid,
+                  status: item.status.toUpperCase(),
+                  errors: item.errors,
+                  instanceId: this.instanceId,
+                });
+              }
+              continue;
             }
 
             if (item.message === null && item.status === undefined) {
@@ -901,6 +979,7 @@ export class BusinessStartupService extends ChannelStartupService {
               fromMe: key.fromMe,
               participant: key?.remoteJid,
               status: item.status.toUpperCase(),
+              errors: item.errors?.length ? item.errors : undefined,
               instanceId: this.instanceId,
             };
 
@@ -1022,7 +1101,8 @@ export class BusinessStartupService extends ChannelStartupService {
           message.type === 'contacts' ||
           message.type === 'interactive' ||
           message.type === 'button' ||
-          message.type === 'reaction'
+          message.type === 'reaction' ||
+          message.type === 'template'
         ) {
           // Procesar el mensaje normalmente
           this.messageHandle({ ...content, messages }, database, settings);
@@ -1062,14 +1142,18 @@ export class BusinessStartupService extends ChannelStartupService {
         webhookUrl = options.webhookUrl;
       }
 
+      const bsuidRecipient = isBsuid(number);
+      const recipientField = bsuidRecipient
+        ? { recipient_type: 'individual', recipient: number }
+        : { recipient_type: 'individual', to: number.replace(/\D/g, '') };
+
       let content: any;
       const messageSent = await (async () => {
         if (message['reactionMessage']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
+            ...recipientField,
             type: 'reaction',
-            to: number.replace(/\D/g, ''),
             reaction: {
               message_id: message['reactionMessage']['key']['id'],
               emoji: message['reactionMessage']['text'],
@@ -1081,9 +1165,8 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['locationMessage']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
+            ...recipientField,
             type: 'location',
-            to: number.replace(/\D/g, ''),
             location: {
               longitude: message['locationMessage']['degreesLongitude'],
               latitude: message['locationMessage']['degreesLatitude'],
@@ -1097,9 +1180,8 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['contacts']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
+            ...recipientField,
             type: 'contacts',
-            to: number.replace(/\D/g, ''),
             contacts: message['contacts'],
           };
           quoted ? (content.context = { message_id: quoted.id }) : content;
@@ -1109,9 +1191,8 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['conversation']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
+            ...recipientField,
             type: 'text',
-            to: number.replace(/\D/g, ''),
             text: {
               body: message['conversation'],
               preview_url: Boolean(options?.linkPreview),
@@ -1125,9 +1206,8 @@ export class BusinessStartupService extends ChannelStartupService {
 
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
+            ...recipientField,
             type: message['mediaType'],
-            to: number.replace(/\D/g, ''),
             [message['mediaType']]: {
               [message['type']]: message['id'],
               ...(message['mediaType'] !== 'audio' &&
@@ -1143,9 +1223,8 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['audio']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
+            ...recipientField,
             type: 'audio',
-            to: number.replace(/\D/g, ''),
             audio: {
               [message['type']]: message['id'],
             },
@@ -1156,8 +1235,7 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['buttons']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to: number.replace(/\D/g, ''),
+            ...recipientField,
             type: 'interactive',
             interactive: {
               type: 'button',
@@ -1180,8 +1258,7 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['listMessage']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to: number.replace(/\D/g, ''),
+            ...recipientField,
             type: 'interactive',
             interactive: {
               type: 'list',
@@ -1215,8 +1292,7 @@ export class BusinessStartupService extends ChannelStartupService {
         if (message['template']) {
           content = {
             messaging_product: 'whatsapp',
-            recipient_type: 'individual',
-            to: number.replace(/\D/g, ''),
+            ...recipientField,
             type: 'template',
             template: {
               name: message['template']['name'],
@@ -1227,7 +1303,62 @@ export class BusinessStartupService extends ChannelStartupService {
             },
           };
           quoted ? (content.context = { message_id: quoted.id }) : content;
-          message = { conversation: `▶️${message['template']['name']}◀️` };
+
+          const components = message['template']['components'] || [];
+
+          const templateMeta: any = {};
+
+          try {
+            const headerComp = components.find((c: any) => (c.type || '').toString().toUpperCase() === 'HEADER');
+
+            const locParam = headerComp?.parameters?.find(
+              (parameter: any) => (parameter.type || '').toString().toLowerCase() === 'location' && parameter.location,
+            );
+
+            if (locParam?.location) {
+              const loc = locParam.location;
+
+              templateMeta.locationMessage = {
+                degreesLatitude: loc.latitude,
+                degreesLongitude: loc.longitude,
+                name: loc.name,
+                address: loc.address,
+                url: loc.url,
+              };
+            }
+
+            const bodyComp = components.find(
+              (component: any) => (component.type || '').toString().toUpperCase() === 'BODY',
+            );
+
+            const footerComp = components.find(
+              (component: any) => (component.type || '').toString().toUpperCase() === 'FOOTER',
+            );
+
+            const variables: any[] = [];
+
+            if (headerComp?.parameters) {
+              variables.push(
+                ...headerComp.parameters.filter(
+                  (parameter: any) => (parameter.type || '').toString().toLowerCase() === 'text',
+                ),
+              );
+            }
+
+            if (bodyComp?.parameters) variables.push(...bodyComp.parameters);
+
+            if (variables.length) templateMeta.variables = variables;
+
+            if (footerComp?.text) templateMeta.footer = footerComp.text;
+          } catch {
+            // Ignores extra data
+          }
+
+          message = {
+            conversation: `▶️${message['template']['name']}◀️`,
+            ...(Object.keys(templateMeta).length ? { templateMeta } : {}),
+          } as any;
+
           return await this.post(content, 'messages');
         }
       })();
@@ -1238,7 +1369,7 @@ export class BusinessStartupService extends ChannelStartupService {
       }
 
       const messageRaw: any = {
-        key: { fromMe: true, id: messageSent?.messages[0]?.id, remoteJid: createJid(number) },
+        key: { fromMe: true, id: messageSent?.messages[0]?.id, remoteJid: bsuidRecipient ? number : createJid(number) },
         message: this.convertMessageToRaw(message, content),
         messageType: this.renderMessageType(content.type),
         messageTimestamp: (messageSent?.messages[0]?.timestamp as number) || Math.round(new Date().getTime() / 1000),

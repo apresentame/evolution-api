@@ -316,6 +316,7 @@ export type ConfigSessionPhone = { CLIENT: string; NAME: string };
 export type Baileys = { VERSION?: string };
 export type QrCode = { LIMIT: number; COLOR: string };
 export type Typebot = { ENABLED: boolean; API_VERSION: string; SEND_MEDIA_BASE64: boolean };
+export type Passkey = { ENABLED: boolean; PUBLIC_URL?: string };
 export type Chatwoot = {
   ENABLED: boolean;
   MESSAGE_DELETE: boolean;
@@ -414,6 +415,7 @@ export interface Env {
   BAILEYS: Baileys;
   QRCODE: QrCode;
   TYPEBOT: Typebot;
+  PASSKEY: Passkey;
   CHATWOOT: Chatwoot;
   OPENAI: Openai;
   DIFY: Dify;
@@ -813,6 +815,10 @@ export class ConfigService {
         ENABLED: process.env?.TYPEBOT_ENABLED === 'true',
         API_VERSION: process.env?.TYPEBOT_API_VERSION || 'old',
         SEND_MEDIA_BASE64: process.env?.TYPEBOT_SEND_MEDIA_BASE64 === 'true',
+      },
+      PASSKEY: {
+        ENABLED: process.env?.PASSKEY_CEREMONY_ENABLED === 'true',
+        PUBLIC_URL: process.env?.PASSKEY_PUBLIC_URL,
       },
       CHATWOOT: {
         ENABLED: process.env?.CHATWOOT_ENABLED === 'true',
