@@ -220,11 +220,24 @@ export class BusinessStartupService extends ChannelStartupService {
         .join('\n');
 
       conversation = answersText || 'Resposta enviada.';
+    } else if (interactiveType === 'call_permission_reply') {
+      conversation = reply.response === 'accept' ? 'Autorizou receber ligações.' : 'Recusou receber ligações.';
     } else {
       conversation = reply.title || reply.description || '';
     }
 
     let content: any = { conversation, interactiveReplyType: interactiveType };
+    if (interactiveType === 'call_permission_reply') {
+      content = {
+        ...content,
+        callPermissionReply: {
+          response: reply.response,
+          isPermanent: !!reply.is_permanent,
+          expirationTimestamp: reply.expiration_timestamp ?? null,
+          responseSource: reply.response_source ?? null,
+        },
+      };
+    }
     message.context ? (content = { ...content, contextInfo: { stanzaId: message.context.id } }) : content;
     return content;
   }
@@ -1078,6 +1091,13 @@ export class BusinessStartupService extends ChannelStartupService {
 
       const database = this.configService.get<Database>('DATABASE');
       const settings = await this.findSettings();
+
+      const isCallStatus =
+        content?.statuses?.length > 0 && content.statuses.every((status: any) => status?.type === 'call');
+      if (content?.calls?.length || isCallStatus) {
+        await this.sendDataWebhook(Events.CALL, content);
+        return;
+      }
 
       // due to coexistence webhook body, we need to check for two possible scenarios
       let messages = [];
