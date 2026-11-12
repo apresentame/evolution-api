@@ -837,9 +837,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.eventHandler();
 
-    // Baileys 7.0.0-rc.9 has no handler for top-level <status> stanzas (contacts' statuses). Unacked, the server
-    // holds back every inbound message and receipt and ends the stream ~50 min later with <ack class="status"/>
-    // (code 500). Same attributes as Baileys' sendMessageAck. Backport of WhiskeySockets/Baileys#2883.
+    // O Baileys rc.9 não confirma o status dos contatos; sem isso o WhatsApp segura as mensagens recebidas e derruba a conexão.
     this.client.ws.on('CB:status', (node: BinaryNode) => {
       const { id, from, participant, recipient, type } = node.attrs;
       this.client
