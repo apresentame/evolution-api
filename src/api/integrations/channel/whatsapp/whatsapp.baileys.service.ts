@@ -83,9 +83,12 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
+import { getAvailableNumbers } from '@utils/getAvailableNumbers';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
-import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
+import { getOnWhatsappCache, removeOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
+import { resolveWhatsappJid } from '@utils/resolveWhatsappJid';
+import { runWithTimeout } from '@utils/runWithTimeout';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
 import { AuthStateProvider } from '@utils/use-multi-file-auth-state-provider-files';
@@ -93,6 +96,7 @@ import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-r
 import axios from 'axios';
 import makeWASocket, {
   AnyMessageContent,
+  BinaryNode,
   BufferedEventData,
   BufferJSON,
   CacheStore,
@@ -255,6 +259,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private isDeleting = false; // Flag to prevent reconnection during deletion
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private static readonly EVENT_BATCH_TIMEOUT_MS = 120_000;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -831,6 +836,26 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     this.eventHandler();
+
+    // Baileys 7.0.0-rc.9 has no handler for top-level <status> stanzas (contacts' statuses). Unacked, the server
+    // holds back every inbound message and receipt and ends the stream ~50 min later with <ack class="status"/>
+    // (code 500). Same attributes as Baileys' sendMessageAck. Backport of WhiskeySockets/Baileys#2883.
+    this.client.ws.on('CB:status', (node: BinaryNode) => {
+      const { id, from, participant, recipient, type } = node.attrs;
+      this.client
+        .sendNode({
+          tag: 'ack',
+          attrs: {
+            id,
+            to: from,
+            class: 'status',
+            ...(participant && { participant }),
+            ...(recipient && { recipient }),
+            ...(type && { type }),
+          },
+        })
+        .catch((error) => this.logger.error(['Failed to ack status stanza', error?.message]));
+    });
 
     this.client.ws.on('CB:call', (packet) => {
       console.log('CB:call', packet);
@@ -1929,6 +1954,8 @@ export class BaileysStartupService extends ChannelStartupService {
             status: status[update.status] ?? 'SERVER_ACK',
             pollUpdates,
             instanceId: this.instanceId,
+            messageStubType: update.messageStubType,
+            messageStubParameters: update.messageStubParameters,
           };
 
           if (update.message) {
@@ -2213,189 +2240,206 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
+  // A batch that never settles (media download, S3 upload, a WhatsApp query with no answer) used to hold the
+  // whole queue: the instance kept sending but stopped receiving messages and receipts until reconnected.
+  private async runEventBatch(events: string[], run: () => Promise<void>) {
+    const timeoutMs = BaileysStartupService.EVENT_BATCH_TIMEOUT_MS;
+
+    if (await runWithTimeout(run(), timeoutMs)) {
+      this.logger.error({
+        message: 'Event batch exceeded the timeout, releasing the event queue',
+        instance: this.instance.name,
+        events,
+        timeoutMs,
+      });
+    }
+  }
+
   private eventHandler() {
     this.client.ev.process(async (events) => {
-      this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
-        try {
-          if (!this.endSession) {
-            const database = this.configService.get<Database>('DATABASE');
-            const settings = await this.findSettings();
+      this.eventProcessingQueue = this.eventProcessingQueue.then(() =>
+        this.runEventBatch(Object.keys(events), async () => {
+          try {
+            if (!this.endSession) {
+              const database = this.configService.get<Database>('DATABASE');
+              const settings = await this.findSettings();
 
-            if (events.call) {
-              const call = events.call[0];
-              let normalizedFrom: string | null = null;
+              if (events.call) {
+                const call = events.call[0];
+                let normalizedFrom: string | null = null;
 
-              if (typeof call.from === 'string' && call.from.endsWith('@lid')) {
-                const originalFrom = call.from;
+                if (typeof call.from === 'string' && call.from.endsWith('@lid')) {
+                  const originalFrom = call.from;
 
-                try {
-                  const resolved = await this.client.signalRepository.lidMapping.getPNForLID(originalFrom as string);
-                  if (resolved && typeof resolved === 'string') {
-                    normalizedFrom = resolved;
-                  }
-                } catch (error) {
-                  this.logger.error([
-                    'Failed to resolve LID for call webhook via lidMapping',
-                    originalFrom,
-                    error?.message,
-                  ]);
-                }
-
-                if (!normalizedFrom) {
                   try {
-                    const cached = await getOnWhatsappCache([originalFrom]);
-                    const match = cached?.find((c) => c.jidOptions.includes(originalFrom));
-                    if (match) {
-                      normalizedFrom = match.remoteJid;
+                    const resolved = await this.client.signalRepository.lidMapping.getPNForLID(originalFrom as string);
+                    if (resolved && typeof resolved === 'string') {
+                      normalizedFrom = resolved;
                     }
                   } catch (error) {
                     this.logger.error([
-                      'Failed to resolve LID for call webhook via cache',
+                      'Failed to resolve LID for call webhook via lidMapping',
                       originalFrom,
                       error?.message,
                     ]);
                   }
+
+                  if (!normalizedFrom) {
+                    try {
+                      const cached = await getOnWhatsappCache([originalFrom]);
+                      const match = cached?.find((c) => c.jidOptions.includes(originalFrom));
+                      if (match) {
+                        normalizedFrom = match.remoteJid;
+                      }
+                    } catch (error) {
+                      this.logger.error([
+                        'Failed to resolve LID for call webhook via cache',
+                        originalFrom,
+                        error?.message,
+                      ]);
+                    }
+                  }
+
+                  if (normalizedFrom) {
+                    const [numberPart, domainPart] = normalizedFrom.split('@');
+                    const cleanNumber = numberPart.split(':')[0];
+
+                    if (domainPart) {
+                      normalizedFrom = `${cleanNumber}@${domainPart}`;
+                    } else {
+                      normalizedFrom = `${cleanNumber}@s.whatsapp.net`;
+                    }
+                    (call as any).fromLid = originalFrom;
+                  }
+                }
+
+                if (settings?.rejectCall && call.status == 'offer') {
+                  this.client.rejectCall(call.id, call.from);
                 }
 
                 if (normalizedFrom) {
-                  const [numberPart, domainPart] = normalizedFrom.split('@');
-                  const cleanNumber = numberPart.split(':')[0];
+                  call.from = normalizedFrom;
+                }
 
-                  if (domainPart) {
-                    normalizedFrom = `${cleanNumber}@${domainPart}`;
-                  } else {
-                    normalizedFrom = `${cleanNumber}@s.whatsapp.net`;
+                if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
+                  const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+                  this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+                }
+
+                this.sendDataWebhook(Events.CALL, call);
+              }
+
+              if (events['connection.update']) {
+                this.connectionUpdate(events['connection.update']);
+              }
+
+              if (events['creds.update']) {
+                this.instance.authState.saveCreds();
+              }
+
+              if (events['messaging-history.set']) {
+                const payload = events['messaging-history.set'];
+                await this.messageHandle['messaging-history.set'](payload);
+              }
+
+              if (events['messages.upsert']) {
+                const payload = events['messages.upsert'];
+
+                // this.messageProcessor.processMessage(payload, settings);
+                await this.messageHandle['messages.upsert'](payload, settings);
+              }
+
+              if (events['messages.update']) {
+                const payload = events['messages.update'];
+                await this.messageHandle['messages.update'](payload, settings);
+              }
+
+              if (events['message-receipt.update']) {
+                const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
+                const remotesJidMap: Record<string, number> = {};
+
+                for (const event of payload) {
+                  if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
+                    remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
                   }
-                  (call as any).fromLid = originalFrom;
+                }
+
+                await Promise.all(
+                  Object.keys(remotesJidMap).map(async (remoteJid) =>
+                    this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+                  ),
+                );
+              }
+
+              if (events['presence.update']) {
+                const payload = events['presence.update'];
+
+                if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
+                  return;
+                }
+
+                this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+              }
+
+              if (!settings?.groupsIgnore) {
+                if (events['groups.upsert']) {
+                  const payload = events['groups.upsert'];
+                  this.groupHandler['groups.upsert'](payload);
+                }
+
+                if (events['groups.update']) {
+                  const payload = events['groups.update'];
+                  this.groupHandler['groups.update'](payload);
+                }
+
+                if (events['group-participants.update']) {
+                  const payload = events['group-participants.update'] as any;
+                  this.groupHandler['group-participants.update'](payload);
                 }
               }
 
-              if (settings?.rejectCall && call.status == 'offer') {
-                this.client.rejectCall(call.id, call.from);
+              if (events['chats.upsert']) {
+                const payload = events['chats.upsert'];
+                this.chatHandle['chats.upsert'](payload);
               }
 
-              if (normalizedFrom) {
-                call.from = normalizedFrom;
+              if (events['chats.update']) {
+                const payload = events['chats.update'];
+                this.chatHandle['chats.update'](payload);
               }
 
-              if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
-                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+              if (events['chats.delete']) {
+                const payload = events['chats.delete'];
+                this.chatHandle['chats.delete'](payload);
               }
 
-              this.sendDataWebhook(Events.CALL, call);
-            }
-
-            if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
-            }
-
-            if (events['creds.update']) {
-              this.instance.authState.saveCreds();
-            }
-
-            if (events['messaging-history.set']) {
-              const payload = events['messaging-history.set'];
-              await this.messageHandle['messaging-history.set'](payload);
-            }
-
-            if (events['messages.upsert']) {
-              const payload = events['messages.upsert'];
-
-              // this.messageProcessor.processMessage(payload, settings);
-              await this.messageHandle['messages.upsert'](payload, settings);
-            }
-
-            if (events['messages.update']) {
-              const payload = events['messages.update'];
-              await this.messageHandle['messages.update'](payload, settings);
-            }
-
-            if (events['message-receipt.update']) {
-              const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-              const remotesJidMap: Record<string, number> = {};
-
-              for (const event of payload) {
-                if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
-                }
+              if (events['contacts.upsert']) {
+                const payload = events['contacts.upsert'];
+                this.contactHandle['contacts.upsert'](payload);
               }
 
-              await Promise.all(
-                Object.keys(remotesJidMap).map(async (remoteJid) =>
-                  this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
-                ),
-              );
-            }
+              if (events['contacts.update']) {
+                const payload = events['contacts.update'];
+                this.contactHandle['contacts.update'](payload);
+              }
 
-            if (events['presence.update']) {
-              const payload = events['presence.update'];
-
-              if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
+              if (events[Events.LABELS_ASSOCIATION]) {
+                const payload = events[Events.LABELS_ASSOCIATION];
+                this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
                 return;
               }
 
-              this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-            }
-
-            if (!settings?.groupsIgnore) {
-              if (events['groups.upsert']) {
-                const payload = events['groups.upsert'];
-                this.groupHandler['groups.upsert'](payload);
-              }
-
-              if (events['groups.update']) {
-                const payload = events['groups.update'];
-                this.groupHandler['groups.update'](payload);
-              }
-
-              if (events['group-participants.update']) {
-                const payload = events['group-participants.update'] as any;
-                this.groupHandler['group-participants.update'](payload);
+              if (events[Events.LABELS_EDIT]) {
+                const payload = events[Events.LABELS_EDIT];
+                this.labelHandle[Events.LABELS_EDIT](payload);
+                return;
               }
             }
-
-            if (events['chats.upsert']) {
-              const payload = events['chats.upsert'];
-              this.chatHandle['chats.upsert'](payload);
-            }
-
-            if (events['chats.update']) {
-              const payload = events['chats.update'];
-              this.chatHandle['chats.update'](payload);
-            }
-
-            if (events['chats.delete']) {
-              const payload = events['chats.delete'];
-              this.chatHandle['chats.delete'](payload);
-            }
-
-            if (events['contacts.upsert']) {
-              const payload = events['contacts.upsert'];
-              this.contactHandle['contacts.upsert'](payload);
-            }
-
-            if (events['contacts.update']) {
-              const payload = events['contacts.update'];
-              this.contactHandle['contacts.update'](payload);
-            }
-
-            if (events[Events.LABELS_ASSOCIATION]) {
-              const payload = events[Events.LABELS_ASSOCIATION];
-              this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-              return;
-            }
-
-            if (events[Events.LABELS_EDIT]) {
-              const payload = events[Events.LABELS_EDIT];
-              this.labelHandle[Events.LABELS_EDIT](payload);
-              return;
-            }
+          } catch (error) {
+            this.logger.error(error);
           }
-        } catch (error) {
-          this.logger.error(error);
-        }
-      });
+        }),
+      );
     });
   }
 
@@ -2695,6 +2739,10 @@ export class BaileysStartupService extends ChannelStartupService {
   ) {
     const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
 
+    if (!isWA) {
+      throw new BadRequestException(`Number ${number} could not be resolved`);
+    }
+
     if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast')) {
       throw new BadRequestException(isWA);
     }
@@ -2959,6 +3007,13 @@ export class BaileysStartupService extends ChannelStartupService {
       return messageRaw;
     } catch (error) {
       this.logger.error(error);
+
+      // The resolved jid is the prime suspect when a send fails, and a cached one would be replayed
+      // on every retry until it expires. Dropping it makes the next attempt ask the server again.
+      if (isPnUser(sender) || sender.includes('@lid')) {
+        await removeOnWhatsappCache(sender);
+      }
+
       throw new BadRequestException(error.toString());
     }
   }
@@ -2969,6 +3024,10 @@ export class BaileysStartupService extends ChannelStartupService {
       const { number } = data;
 
       const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
+
+      if (!isWA) {
+        throw new BadRequestException(`Number ${number} could not be resolved`);
+      }
 
       if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast')) {
         throw new BadRequestException(isWA);
@@ -3970,11 +4029,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // Separate numbers that are and are not in cache
     const cachedJids = new Set(cachedNumbers.flatMap((cached) => cached.jidOptions));
-    const numbersNotInCache = numbersToVerify.filter((jid) => !cachedJids.has(jid));
+    const numbersNotInCache = numbersToVerify.filter(
+      (jid) => !getAvailableNumbers(jid).some((variant) => cachedJids.has(variant)),
+    );
 
-    // Only call Baileys for normal numbers (@s.whatsapp.net) that are not in cache
+    // Only call Baileys for normal numbers (@s.whatsapp.net) that are not in cache.
+    // Every accepted variant is queried at once, because the registered form is the server's call:
+    // asking only for the variant we guessed is what makes a valid number look non-existent.
     let verify: { jid: string; exists: boolean }[] = [];
-    const normalNumbersNotInCache = numbersNotInCache.filter((jid) => !jid.includes('@lid'));
+    const normalNumbersNotInCache = [
+      ...new Set(numbersNotInCache.filter((jid) => !jid.includes('@lid')).flatMap((jid) => getAvailableNumbers(jid))),
+    ];
 
     if (normalNumbersNotInCache.length > 0) {
       this.logger.verbose(`Checking ${normalNumbersNotInCache.length} numbers via Baileys (not found in cache)`);
@@ -3983,8 +4048,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const verifiedUsers = await Promise.all(
       jids.users.map(async (user) => {
+        const userJid = user.jid.replace('+', '');
+        const variants = getAvailableNumbers(userJid);
+
         // Try to get from cache first (works for all: normal and LID)
-        const cached = cachedNumbers.find((cached) => cached.jidOptions.includes(user.jid.replace('+', '')));
+        const cached = cachedNumbers.find((cached) => cached.jidOptions.some((option) => variants.includes(option)));
 
         if (cached) {
           this.logger.verbose(`Number ${user.number} found in cache`);
@@ -3997,8 +4065,16 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        // If it's a LID number and not in cache, consider it valid
-        if (user.jid.includes('@lid')) {
+        // Baileys refuses LIDs on onWhatsApp, so there is no way to verify them through usync.
+        // The mapping to a phone number is the only signal available, and its absence is worth a log:
+        // the number is still trusted, as it was before, but silently this time.
+        if (userJid.includes('@lid')) {
+          const { jid: mappedJid } = await this.lidToJid(userJid);
+
+          if (!mappedJid) {
+            this.logger.warn(`LID ${userJid} could not be mapped to a phone number, assuming it exists`);
+          }
+
           return new OnWhatsAppDto(
             user.jid,
             true,
@@ -4008,55 +4084,14 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        // If not in cache and is a normal number, use Baileys verification
-        let numberVerified: (typeof verify)[0] | null = null;
-
-        // Brazilian numbers
-        if (user.number.startsWith('55')) {
-          const numberWithDigit =
-            user.number.slice(4, 5) === '9' && user.number.length === 13
-              ? user.number
-              : `${user.number.slice(0, 4)}9${user.number.slice(4)}`;
-          const numberWithoutDigit =
-            user.number.length === 12 ? user.number : user.number.slice(0, 4) + user.number.slice(5);
-
-          numberVerified = verify.find(
-            (v) => v.jid === `${numberWithDigit}@s.whatsapp.net` || v.jid === `${numberWithoutDigit}@s.whatsapp.net`,
-          );
-        }
-
-        // Mexican/Argentina numbers
-        // Ref: https://faq.whatsapp.com/1294841057948784
-        if (!numberVerified && (user.number.startsWith('52') || user.number.startsWith('54'))) {
-          let prefix = '';
-          if (user.number.startsWith('52')) {
-            prefix = '1';
-          }
-          if (user.number.startsWith('54')) {
-            prefix = '9';
-          }
-
-          const numberWithDigit =
-            user.number.slice(2, 3) === prefix && user.number.length === 13
-              ? user.number
-              : `${user.number.slice(0, 2)}${prefix}${user.number.slice(2)}`;
-          const numberWithoutDigit =
-            user.number.length === 12 ? user.number : user.number.slice(0, 2) + user.number.slice(3);
-
-          numberVerified = verify.find(
-            (v) => v.jid === `${numberWithDigit}@s.whatsapp.net` || v.jid === `${numberWithoutDigit}@s.whatsapp.net`,
-          );
-        }
-
-        if (!numberVerified) {
-          numberVerified = verify.find((v) => v.jid === user.jid);
-        }
-
-        const numberJid = numberVerified?.jid || user.jid;
+        // If not in cache and is a normal number, use Baileys verification.
+        // The server answer is the authority on both existence and canonical form, so it is adopted
+        // as is instead of being matched against the jid we guessed.
+        const { jid: numberJid, exists } = resolveWhatsappJid(userJid, verify);
 
         return new OnWhatsAppDto(
           numberJid,
-          !!numberVerified?.exists,
+          exists,
           user.number,
           contacts.find((c) => c.remoteJid === numberJid)?.pushName,
           undefined,
@@ -4071,7 +4106,8 @@ export class BaileysStartupService extends ChannelStartupService {
     const numbersToCache = onWhatsapp.filter((user) => {
       if (!user.exists) return false;
       // Verifica se estava no cache usando jidOptions
-      const cached = cachedNumbers?.find((cached) => cached.jidOptions.includes(user.jid.replace('+', '')));
+      const variants = getAvailableNumbers(user.jid.replace('+', ''));
+      const cached = cachedNumbers?.find((cached) => cached.jidOptions.some((option) => variants.includes(option)));
       return !cached;
     });
 

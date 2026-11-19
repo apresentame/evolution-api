@@ -4,61 +4,9 @@ import { Logger } from '@config/logger.config';
 import { Prisma } from '@prisma/client';
 import dayjs from 'dayjs';
 
+import { getAvailableNumbers } from './getAvailableNumbers';
+
 const logger = new Logger('OnWhatsappCache');
-
-function getAvailableNumbers(remoteJid: string) {
-  const numbersAvailable: string[] = [];
-
-  if (remoteJid.startsWith('+')) {
-    remoteJid = remoteJid.slice(1);
-  }
-
-  const [number, domain] = remoteJid.split('@');
-
-  // TODO: Se já for @lid, retornar apenas ele mesmo SEM adicionar @domain novamente
-  if (domain === 'lid' || domain === 'g.us') {
-    return [remoteJid]; // Retorna direto para @lid e @g.us
-  }
-
-  // Brazilian numbers
-  if (remoteJid.startsWith('55')) {
-    const numberWithDigit =
-      number.slice(4, 5) === '9' && number.length === 13 ? number : `${number.slice(0, 4)}9${number.slice(4)}`;
-    const numberWithoutDigit = number.length === 12 ? number : number.slice(0, 4) + number.slice(5);
-
-    numbersAvailable.push(numberWithDigit);
-    numbersAvailable.push(numberWithoutDigit);
-  }
-
-  // Mexican/Argentina numbers
-  // Ref: https://faq.whatsapp.com/1294841057948784
-  else if (number.startsWith('52') || number.startsWith('54')) {
-    let prefix = '';
-    if (number.startsWith('52')) {
-      prefix = '1';
-    }
-    if (number.startsWith('54')) {
-      prefix = '9';
-    }
-
-    const numberWithDigit =
-      number.slice(2, 3) === prefix && number.length === 13
-        ? number
-        : `${number.slice(0, 2)}${prefix}${number.slice(2)}`;
-    const numberWithoutDigit = number.length === 12 ? number : number.slice(0, 2) + number.slice(3);
-
-    numbersAvailable.push(numberWithDigit);
-    numbersAvailable.push(numberWithoutDigit);
-  }
-
-  // Other countries
-  else {
-    numbersAvailable.push(remoteJid);
-  }
-
-  // TODO: Adiciona @domain apenas para números que não são @lid
-  return numbersAvailable.map((number) => `${number}@${domain}`);
-}
 
 interface ISaveOnWhatsappCacheParams {
   remoteJid: string;
@@ -228,4 +176,40 @@ export async function getOnWhatsappCache(remoteJids: string[]) {
   }
 
   return results;
+}
+
+/**
+ * Drops the cached record of a number.
+ *
+ * A cached entry asserts that a jid exists and is the one to send to. When the send itself fails,
+ * that assertion is the prime suspect: without removing it the same wrong jid would be replayed on
+ * every retry until IS_ON_WHATSAPP_DAYS expires. Dropping it costs one usync query on the next
+ * attempt, and the answer is written back to the cache right after.
+ */
+export async function removeOnWhatsappCache(remoteJid: string) {
+  if (!configService.get<Database>('DATABASE').SAVE_DATA.IS_ON_WHATSAPP) {
+    return;
+  }
+
+  try {
+    const jid = normalizeJid(remoteJid);
+    if (!jid) {
+      return;
+    }
+
+    const expandedJids = getAvailableNumbers(jid);
+
+    const removed = await prismaRepository.isOnWhatsapp.deleteMany({
+      where: {
+        OR: [...expandedJids.map((option) => ({ jidOptions: { contains: option } })), { remoteJid: jid }],
+      },
+    });
+
+    if (removed.count > 0) {
+      logger.verbose(`[removeOnWhatsappCache] Dropped ${removed.count} stale record(s) for ${jid}`);
+    }
+  } catch (e) {
+    logger.error(`[removeOnWhatsappCache] Error removing ${remoteJid}: `);
+    logger.error(e);
+  }
 }
