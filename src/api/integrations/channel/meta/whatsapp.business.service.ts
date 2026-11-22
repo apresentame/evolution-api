@@ -124,12 +124,22 @@ export class BusinessStartupService extends ChannelStartupService {
     return await this.post(content, 'whatsapp_business_profile');
   }
 
-  public async connectToWhatsapp(data?: any): Promise<any> {
+  public async connectToWhatsapp(data?: any, change?: any): Promise<any> {
     if (!data) return;
 
-    const content = data.entry[0].changes[0].value;
+    // `change` comes from MetaController, which already walked entries/changes. The fallback keeps the
+    // previous behaviour for any other caller, and optional chaining avoids throwing when this method is
+    // reached through the generic instance flow (where `data` is a phone number, not a webhook payload).
+    const content = change?.value ?? data?.entry?.[0]?.changes?.[0]?.value;
+
+    if (!content) return;
 
     try {
+      // Conversation history sync (coexistence). It carries no single counterpart number and must not
+      // go through the live message pipeline: it is only forwarded, and whoever consumes the webhook
+      // decides when to turn it into conversations.
+      if (content.history) return this.historyHandle(content);
+
       this.loadChatwoot();
 
       let phoneNumber = null;
@@ -146,6 +156,24 @@ export class BusinessStartupService extends ChannelStartupService {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
     }
+  }
+
+  /**
+   * Forwards the `history` webhook field as-is.
+   *
+   * Meta only delivers conversation history for coexistence numbers, in asynchronous chunks, and only
+   * once per onboarding — so nothing is parsed, stored or run through the chatbot here: dropping a chunk
+   * is permanent. It reuses the MESSAGES_SET event because every consumer is already subscribed to it;
+   * the `historySync` flag tells the two payload shapes apart.
+   */
+  private async historyHandle(content: any) {
+    const chunks = Array.isArray(content.history) ? content.history : [content.history];
+
+    await this.sendDataWebhook(Events.MESSAGES_SET, chunks, true, undefined, {
+      historySync: true,
+      phoneNumberId: content?.metadata?.phone_number_id ?? null,
+      displayPhoneNumber: content?.metadata?.display_phone_number ?? null,
+    });
   }
 
   private async downloadMediaMessage(message: any) {
@@ -220,11 +248,24 @@ export class BusinessStartupService extends ChannelStartupService {
         .join('\n');
 
       conversation = answersText || 'Resposta enviada.';
+    } else if (interactiveType === 'call_permission_reply') {
+      conversation = reply.response === 'accept' ? 'Autorizou receber ligações.' : 'Recusou receber ligações.';
     } else {
       conversation = reply.title || reply.description || '';
     }
 
     let content: any = { conversation, interactiveReplyType: interactiveType };
+    if (interactiveType === 'call_permission_reply') {
+      content = {
+        ...content,
+        callPermissionReply: {
+          response: reply.response,
+          isPermanent: !!reply.is_permanent,
+          expirationTimestamp: reply.expiration_timestamp ?? null,
+          responseSource: reply.response_source ?? null,
+        },
+      };
+    }
     message.context ? (content = { ...content, contextInfo: { stanzaId: message.context.id } }) : content;
     return content;
   }
@@ -1078,6 +1119,13 @@ export class BusinessStartupService extends ChannelStartupService {
 
       const database = this.configService.get<Database>('DATABASE');
       const settings = await this.findSettings();
+
+      const isCallStatus =
+        content?.statuses?.length > 0 && content.statuses.every((status: any) => status?.type === 'call');
+      if (content?.calls?.length || isCallStatus) {
+        await this.sendDataWebhook(Events.CALL, content);
+        return;
+      }
 
       // due to coexistence webhook body, we need to check for two possible scenarios
       let messages = [];
