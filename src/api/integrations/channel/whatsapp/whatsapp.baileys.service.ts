@@ -255,6 +255,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private passkeyCeremony?: PasskeyCeremony;
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
+  // mesmo arquivo (mesma URL) mandado a vários contatos sobe ao WhatsApp uma vez; 1 h cobre um envio em série (Apre.Chat, 26/11/2026)
+  private readonly mediaCache: CacheStore = new NodeCache({ stdTTL: 3600, useClones: false });
   private endSession = false;
   private isDeleting = false; // Flag to prevent reconnection during deletion
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
@@ -765,6 +767,7 @@ export class BaileysStartupService extends ChannelStartupService {
         keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, P({ level: 'error' }) as any),
       },
       msgRetryCounterCache: this.msgRetryCounterCache,
+      mediaCache: this.mediaCache,
       generateHighQualityLinkPreview: true,
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
       ...browserOptions,
@@ -3246,7 +3249,7 @@ export class BaileysStartupService extends ChannelStartupService {
         {
           [type]: mediaInput,
         } as any,
-        { upload: this.client.waUploadToServer },
+        { upload: this.client.waUploadToServer, mediaCache: this.mediaCache },
       );
 
       const mediaType = mediaMessage.mediatype + 'Message';
